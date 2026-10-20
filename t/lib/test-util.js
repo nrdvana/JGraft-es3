@@ -146,7 +146,7 @@ function runCase(t, test, apply) {
 
 // Provisional adapter: this is the only place tied to the implementation API.
 function applyGraft(input, graft, limits) {
-   return new global.JGraft().apply(input, graft, limits);
+   return new global.JGraft(graft, {limits: limits}).apply(input);
 }
 
 function runConformanceTests(t, source, apply) {

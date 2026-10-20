@@ -142,26 +142,28 @@ TAP(function(t) {
    });
 
    t.subtest('default adapter and pending implementation', function(t) {
-      var saved= JGraft.prototype.apply, input= {a: 1}, test= fixture(input, 7);
-      var result, instance, args;
+      var saved= JGraft, input= {a: 1}, test= fixture(input, 7);
+      var result, instance, args, specification, config;
       test.limits= {ops: 9};
       try {
-         JGraft.prototype.apply= function(a, b, c) {
+         JGraft= function(graft, options) {
+            specification= graft;
+            config= options;
+         };
+         JGraft.prototype.apply= function(a) {
             instance= this;
-            args= [a, b, c];
+            args= arguments;
             return 7;
          };
          result= check(test);
          t.ok(result.success && instance instanceof JGraft, 'default adapter constructs a JGraft');
-         t.ok(args[0] === input && args[1] === test.jgraft && args[2] === test.limits, 'default adapter forwards the case');
+         t.ok(args.length === 1 && args[0] === input && specification === test.jgraft
+            && config.limits === test.limits, 'default adapter forwards the case');
          delete JGraft.prototype.apply;
          result= check(test);
          t.ok(result.success && result._plan === 0 && !result.results.length, 'missing implementation produces an explicit skipped plan');
       } finally {
-         if (saved === undefined)
-            delete JGraft.prototype.apply;
-         else
-            JGraft.prototype.apply= saved;
+         JGraft= saved;
       }
    });
    t.done_testing();
