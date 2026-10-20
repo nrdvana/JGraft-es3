@@ -16,8 +16,9 @@ my @engines= qw(phantomjs node);
 # //; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS;
 # import runs the original file and exits before Perl parses the JavaScript.
 # -load accepts a filename or array of filenames, relative to the test file.
-# TESTJS selects phantomjs (the default), node, or all. TESTJS_TIMEOUT is a
-# per-engine wall-clock limit in ms, including startup and synchronous code.
+# TESTJS selects phantomjs, node, or all. By default, use the first installed
+# engine in that order. TESTJS_TIMEOUT is a per-engine wall-clock limit in ms,
+# including startup and synchronous code.
 sub import {
    my ($class, @options)= @_;
    my (undef, $file)= caller;
@@ -125,7 +126,17 @@ sub run_test {
       -f $path or die "TestJS dependency does not exist: $path\n";
       $path;
    } @load;
-   my $mode= $ENV{TESTJS} || 'phantomjs';
+   my $mode= $ENV{TESTJS};
+   unless ($mode) {
+      ($mode)= grep {
+         my $engine= $_;
+         grep {
+            my $path= File::Spec->catfile($_, $engine);
+            -f $path && -x $path;
+         } File::Spec->path;
+      } @engines;
+      defined $mode or die "TestJS requires phantomjs or node installed in PATH\n";
+   }
    $mode eq 'all' || grep { $_ eq $mode } @engines
       or die "Unknown TESTJS engine '$mode' (expected @engines or all)\n";
    my $timeout= defined $ENV{TESTJS_TIMEOUT}? $ENV{TESTJS_TIMEOUT} : 10000;

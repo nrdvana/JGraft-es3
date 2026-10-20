@@ -141,6 +141,46 @@ subtest 'all engines' => sub {
    like($output, qr/^not ok 2 - node$/m, 'reports the Node timeout');
 };
 
+subtest 'default engine selection' => sub {
+   my $bin= File::Spec->catdir($dir, 'default-engines');
+   mkdir $bin or die "Cannot create $bin: $!";
+   for my $engine (qw(phantomjs node)) {
+      my $command= File::Spec->catfile($bin, $engine);
+      open my $fh, '>', $command or die "Cannot write $command: $!";
+      print {$fh} "#!$^X\nprint \"ok 1 - selected $engine\\n1..1\\n\";\n";
+      close $fh or die "Cannot close $command: $!";
+      chmod 0755, $command or die "Cannot chmod $command: $!";
+   }
+   local $ENV{PATH}= $bin;
+   my ($status, $output)= run_fixture(undef, 'default both', '');
+   is($status, 0, 'default succeeds with both engines installed');
+   like($output, qr/^ok 1 - selected phantomjs$/m, 'default prefers PhantomJS');
+
+   ($status, $output)= run_fixture('node', 'explicit node', '');
+   is($status, 0, 'explicit Node selection succeeds');
+   like($output, qr/^ok 1 - selected node$/m, 'explicit selection overrides preference');
+
+   chmod 0644, "$bin/phantomjs" or die "Cannot chmod stand-in PhantomJS: $!";
+   ($status, $output)= run_fixture(undef, 'default nonexecutable phantom', '');
+   is($status, 0, 'ignores a nonexecutable PhantomJS');
+   like($output, qr/^ok 1 - selected node$/m, 'falls back to Node');
+
+   unlink "$bin/phantomjs" or die "Cannot remove stand-in PhantomJS: $!";
+   ($status, $output)= run_fixture('', 'default node only', '');
+   is($status, 0, 'empty TESTJS also chooses an available engine');
+   like($output, qr/^ok 1 - selected node$/m, 'uses Node when PhantomJS is absent');
+
+   ($status, $output)= run_fixture('phantomjs', 'explicit missing phantom', '');
+   isnt($status, 0, 'explicit missing engine fails without fallback');
+   like($output, qr/Cannot start phantomjs/, 'identifies the explicitly requested engine');
+
+   unlink "$bin/node" or die "Cannot remove stand-in Node: $!";
+   ($status, $output)= run_fixture(undef, 'default neither', '');
+   isnt($status, 0, 'default fails when neither engine is available');
+   like($output, qr/TestJS requires phantomjs or node installed in PATH/,
+      'explains that an engine is required');
+};
+
 # Stand-in commands use a barrier, so a sequential launcher would time out.
 # Enough output to fill pipes also checks concurrent draining and stderr capture.
 subtest 'parallel launch and process cleanup' => sub {
