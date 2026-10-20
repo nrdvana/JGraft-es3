@@ -182,11 +182,11 @@
       }
 
       // Declare number of tests, before or after execution of tests
-      TAP.prototype.plan= function(count) {
+      TAP.prototype.plan= function(count, skipReason) {
          if (this._plan != null)
             throw "Plan was already declared";
          this._plan= count;
-         this.emit('1..' + count);
+         this.emit('1..' + count + (skipReason? ' # SKIP ' + skipReason : ''));
       }
       // Check plan, or declare the plan to be whatever number of tests ran
       TAP.prototype.done_testing= function(count) {

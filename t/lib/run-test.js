@@ -76,6 +76,42 @@ if (browser) {
    });
 }
 
+var testFile= scripts[scripts.length - 1];
+
+// Fixture paths are relative to the test, independent of the working directory.
+function readTestFile(filename) {
+   var path;
+   if (browser) {
+      path= /^(?:[\\/]|[A-Za-z]:)/.test(filename)? filename
+         : fs.absolute(testFile).replace(/[^\\/]*$/, "") + filename;
+      if (!fs.isFile(path))
+         throw new Error("Cannot read test data: " + path);
+      return fs.read(path);
+   }
+   path= require("path").resolve(require("path").dirname(testFile), filename);
+   return fs.readFileSync(path, "utf8");
+}
+
+// Phantom's page cannot require fs; its synchronous callback bridges file reads.
+if (browser) {
+   page.onCallback= function(filename) {
+      try {
+         return {text: readTestFile(filename)};
+      } catch (error) {
+         return {error: String(error)};
+      }
+   };
+   page.evaluate(function() {
+      window.TestJS= {readFile: function(filename) {
+         var result= window.callPhantom(filename);
+         if (result.error)
+            throw new Error(result.error);
+         return result.text;
+      }};
+   });
+} else
+   global.TestJS= {readFile: readTestFile};
+
 // External script injection preserves the real filename in browser errors.
 // Node's vm supplies the same filename without wrapping the source in a function.
 try {
