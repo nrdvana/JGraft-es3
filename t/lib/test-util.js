@@ -1,10 +1,26 @@
-// JGraftTest.run(t, filenameOrSuite[, apply]) runs one suite as a TAP subtest.
+// TestJS.runConformanceTests(t, filenameOrSuite[, apply]) runs one suite as a TAP subtest.
 // Filenames are relative to the test file. Inline suites may contain Dates.
 // apply(input, graft, limits) returns the output or throws an error with .code.
 // String error codes are also accepted. Supplying apply lets this helper be
 // tested independently and keeps the eventual library API in one adapter.
 (function(global) {
 "use strict";
+
+// Keep host-provided methods, such as the Node/Phantom filesystem bridge.
+var TestJS= global.TestJS || (global.TestJS= {});
+
+// HTTP tests use the document base URL supplied by the manual test server.
+// Synchronous reads match the local harness and keep conformance tests simple.
+if (typeof TestJS.readFile !== "function" && typeof global.XMLHttpRequest !== "undefined") {
+   TestJS.readFile= function(filename) {
+      var xhr= new global.XMLHttpRequest();
+      xhr.open("GET", filename, false);
+      xhr.send(null);
+      if (xhr.status !== 200)
+         throw new Error("Cannot read test data: " + filename + " (HTTP " + xhr.status + ")");
+      return xhr.responseText;
+   };
+}
 
 var objectTag= Object.prototype.toString;
 var hasOwn= Object.prototype.hasOwnProperty;
@@ -131,10 +147,10 @@ function applyGraft(input, graft, limits) {
    return new global.JGraft().apply(input, graft, limits);
 }
 
-function run(t, source, apply) {
+function runConformanceTests(t, source, apply) {
    var suite, i;
    try {
-      suite= typeof source === "string"? JSON.parse(global.TestJS.readFile(source)) : source;
+      suite= typeof source === "string"? JSON.parse(TestJS.readFile(source)) : source;
       if (!suite || suite.version !== 1 || typeof suite.name !== "string"
             || tag(suite.tests) !== "[object Array]" || !suite.tests.length)
          throw new Error("Expected a version 1 conformance suite with a name and nonempty tests array");
@@ -155,7 +171,7 @@ function run(t, source, apply) {
    });
 }
 
-global.JGraftTest= {run: run};
+TestJS.runConformanceTests= runConformanceTests;
 
 })(typeof window !== "undefined"? window
    : typeof global !== "undefined"? global

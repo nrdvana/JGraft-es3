@@ -1,0 +1,173 @@
+#!/usr/bin/env perl
+# Optional manual browser runner; Mojolicious is not needed by prove.
+#   t/serve-tests daemon -l http://0.0.0.0:3000
+# The repository is the document root; / is the only directory index.
+# /t/test.t wraps a tracked test; ?raw=1 returns its source.
+# New files must be added to Git before this app will serve them.
+use strict;
+use warnings;
+use Mojolicious::Lite;
+use Cwd qw(abs_path);
+use File::Basename qw(dirname);
+use Mojo::URL;
+use Mojo::Util qw(xml_escape);
+
+sub git_output {
+   my ($dir, @args)= @_;
+   open my $pipe, '-|', 'git', '-C', $dir, @args or die "Cannot start git: $!\n";
+   local $/;
+   my $output= <$pipe>;
+   close $pipe or die "git @args failed\n";
+   return $output;
+}
+
+my $root= git_output(dirname(abs_path(__FILE__)), 'rev-parse', '--show-toplevel');
+chomp $root;
+$root= abs_path($root);
+
+# No public directory, embedded static assets, or built-in favicon may bypass
+# the Git allowlist. Each request refreshes it to respect git add/rm immediately.
+app->static->paths([]);
+app->static->classes([]);
+app->static->extra({});
+
+sub git_files {
+   return {map { $_ => 1 } split /\0/,
+      git_output($root, 'ls-files', '--cached', '--recurse-submodules', '-z')};
+}
+
+sub normalize {
+   my ($path)= @_;
+   return if $path =~ /\0/;
+   my @parts;
+   for (split m{/+}, $path) {
+      next if $_ eq '' || $_ eq '.';
+      if ($_ eq '..') {
+         return unless @parts;
+         pop @parts;
+      } else {
+         push @parts, $_;
+      }
+   }
+   return join '/', @parts;
+}
+
+# Check both the requested name and its real target. Tracked symlinks cannot
+# expose untracked files or escape the repository through linked directories.
+sub known_file {
+   my ($files, $relative)= @_;
+   return unless defined $relative && $files->{$relative};
+   my $real= abs_path("$root/$relative");
+   return unless defined $real && -f $real && index($real, "$root/") == 0;
+   my $canonical= substr($real, length($root) + 1);
+   return $files->{$canonical}? $real : undef;
+}
+
+sub url_path {
+   my ($path)= @_;
+   my $url= Mojo::URL->new;
+   $url->path->parts(['', split m{/}, $path]);
+   return "$url";
+}
+
+sub html {
+   my ($title, $body, $head)= @_;
+   $body //= '';
+   $head //= '';
+   return <<HTML
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>@{[ xml_escape($title) ]}</title>
+$head
+  </head>
+  <body>
+$body
+  </body>
+</html>
+HTML
+}
+
+# Read literal -load declarations without evaluating Perl or executing tests.
+# Both quoted filenames and arrays of quoted filenames match the TestJS preamble.
+sub test_dependencies {
+   my ($file)= @_;
+   open my $fh, '<', $file or die "Cannot read test: $!\n";
+   my $header= <$fh>;
+   close $fh;
+   return unless defined $header && $header =~ m{\A//;.*\buse\s+TestJS\b(.*)};
+   my $options= $1;
+   my $quoted= qr/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/;
+   my $value= qr/(?:$quoted|\[\s*(?:$quoted\s*(?:,\s*$quoted\s*)*,?)?\])/;
+   my @load;
+   while ($options =~ s/-load\s*=>\s*($value)//) {
+      my $literal= $1;
+      while ($literal =~ /($quoted)/g) {
+         my $name= $1;
+         my $quote= substr($name, 0, 1, '');
+         chop $name;
+         die "Use literal -load filenames for browser tests\n"
+            if $quote eq '"' && $name =~ /[\$\@]|\\[^\\"]/;
+         if ($quote eq "'") {
+            $name =~ s/\\([\\'])/$1/g;
+         } else {
+            $name =~ s/\\([\\"])/$1/g;
+         }
+         push @load, $name;
+      }
+   }
+   die "Use literal -load filenames for browser tests\n" if $options =~ /-load\b/;
+   return \@load;
+}
+
+get '/' => sub {
+   my ($c)= @_;
+   my $files= git_files();
+   my @tests= sort grep { m{\At/.+\.t\z} && known_file($files, $_) } keys %$files;
+   my $body= qq{    <h1>JavaScript tests</h1>\n    <ul>\n};
+   for my $test (@tests) {
+      my $name= substr($test, 2);
+      $body .= '      <li><a href="' . xml_escape(url_path($test)) . '">'
+         . xml_escape($name) . "</a></li>\n";
+   }
+   $body .= qq{    </ul>\n<p>Only files added to Git are available.</p>\n};
+   $c->render(data => html('JavaScript tests', $body), format => 'html');
+};
+
+get '/*file' => sub {
+   my ($c)= @_;
+   my $relative= normalize($c->param('file'));
+   my $file= known_file(git_files(), $relative);
+   return $c->render(text => 'Not found', status => 404) unless $file;
+   $c->res->headers->cache_control('no-store');
+   if ($relative =~ m{\At/.+\.t\z} && !$c->param('raw')) {
+      my $load= eval { test_dependencies($file) };
+      return $c->render(text => "$@", status => 400) if $@;
+      my $body= '    <h1>' . xml_escape(substr($relative, 2)) . qq{</h1>\n};
+      $body .= qq{    <script type="text/javascript" src="/t/lib/firebug-lite.min.js#startOpened=true,overrideConsole=true"></script>\n}
+         if $c->param('firebug');
+      if (!defined $load) {
+         $body .= qq{    <p>This is a Perl-only test. Run it with prove.</p>\n};
+      } else {
+         my @scripts= ('/t/lib/tap.js', '/t/lib/test-util.js');
+         my %seen= map { $_ => 1 } @scripts;
+         for my $dependency (@$load) {
+            my $path= normalize(dirname($relative) . '/' . $dependency);
+            return $c->render(text => 'Dependency outside repository', status => 400) unless defined $path;
+            my $url= url_path($path);
+            push @scripts, $url unless $seen{$url}++;
+         }
+         push @scripts, url_path($relative) . '?raw=1';
+         $body .= join '', map { '    <script type="text/javascript" src="' . xml_escape($_) . qq{"></script>\n} } @scripts;
+      }
+      my $base= url_path(dirname($relative)) . '/';
+      return $c->render(data => html(substr($relative, 2), $body,
+         '    <base href="' . xml_escape($base) . qq{">\n}
+         . '    <link rel="stylesheet" href="/t/lib/tap.css">'), format => 'html');
+   }
+   $c->res->headers->content_type('application/javascript; charset=utf-8') if $relative =~ /\.t\z/;
+   $c->reply->file($file);
+};
+
+app->start;

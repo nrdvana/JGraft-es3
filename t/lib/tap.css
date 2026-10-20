@@ -1,0 +1,110 @@
+body {
+   margin: 0;
+   padding: 0;
+   background-color: black;
+   color: #DDD;
+}
+.tap-output.root {
+   background-color: black;
+   color: #DDD;
+   padding: 4px;
+   font-size: 12px;
+   font-family:Consolas,Inconsolata,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New, monospace;
+}
+.tap-output.subtest {
+   border-left: 1px solid #444;
+   margin: .4em 2px .3em 20px;
+   padding: 0 0 0 4px;
+}
+.tap-output.subtest.pass {
+   border-left-color: #4F5;
+}
+.tap-output.subtest.pass > .name {
+   border-color: #4F5;
+}
+.tap-output.subtest.fail {
+   border-left-color: #F54;
+}
+.tap-output.subtest.fail > .name {
+   border-color: #F54;
+}
+.tap-output.subtest.todo {
+   border-left-color: #FD4;
+}
+.tap-output.subtest.todo > .name {
+   border-color: #FD4;
+   color: #FD4;
+}
+.tap-output.subtest.skipped {
+   border-left-color: #888;
+}
+.tap-output.subtest.skipped > .name {
+   border-color: #888;
+   color: #AAA;
+}
+.tap-output.subtest.collapse > .subtest,
+.tap-output.subtest.collapse > .result,
+.tap-output.subtest.collapse > .note,
+.tap-output.subtest.collapse > .exception
+{
+   display: none;
+}
+.tap-output.subtest .name {
+   display: inline-block;
+   position: relative;
+   width: auto;
+   min-width: 10em;
+   white-space: nowrap;
+   margin: 0 auto 0 -5px;
+   padding: 1px .5em 1px .5em;
+   border: 1px solid #444;
+   font-weight: bold;
+   color: white;
+}
+.tap-output.subtest .name > * {
+   margin-top: .5em;
+}
+.tap-output.subtest .name::before {
+   position: absolute;
+   left: -1em;
+   width: 1em;
+   text-align: left;
+   content: 'v';
+   color: #777;
+}
+.tap-output.subtest.collapse .name::before {
+   content: '>';
+}
+.tap-output.subtest .name::after {
+   content: '';
+   display: block;
+   line-height: 0;
+}
+
+.tap-output .result {
+   display: block;
+   margin: 2px 0;
+}
+.tap-output ~ .result {
+   margin: 0px 0 4px 0;
+}
+.tap-output .result .flag {
+   display: inline-block;
+   width: 50px;
+}
+.tap-output .result .test-id {
+   display: inline-block;
+   width: 30px;
+   color: white;
+   font-weight: bold;
+}
+.tap-output .result.pass > .flag { color: #4F5; border-color: #4F5; }
+.tap-output .result.fail > .flag { color: #F54; border-color: #F54; }
+.tap-output .result.todo > .flag { color: #FD4; border-color: #FD4; }
+.tap-output .result.skipped > .flag { color: #AAA; border-color: #888; }
+.tap-output .result .actual,
+.tap-output .result .expected
+{
+   display: block;
+   font-family: monospace;
+}

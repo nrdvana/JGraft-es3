@@ -12,6 +12,9 @@
  *       t.note(...)
  *       t.is(...)
  *     })
+ *     t.todo('Not implemented yet', function(t) {
+ *       t.is(...)
+ *     })
  *   })
  *
  * to queue additional tests to be executed.  Execution is delayed until the document is loaded.
@@ -64,6 +67,7 @@
          }
          this.results= []
          this.success= true
+         this.actual_success= true
          this.failed_count= 0
          this.prefix= ''
          this.subtest_level= 0
@@ -73,6 +77,7 @@
          }
          else if (arguments.length == 2) {
             var parent= arguments[0]
+            this._todo= parent._todo
             this.name= arguments[1]
             this.message= 'Subtest: ' + this.name
             this.prefix= parent.prefix + '    '
@@ -186,45 +191,75 @@
          if (this._plan != null)
             throw "Plan was already declared";
          this._plan= count;
+         this.skipped= count === 0 && !!skipReason;
          this.emit('1..' + count + (skipReason? ' # SKIP ' + skipReason : ''));
       }
       // Check plan, or declare the plan to be whatever number of tests ran
       TAP.prototype.done_testing= function(count) {
+         var i;
          if (this._plan == null)
             this.plan(this.results.length)
          else if (this._plan != this.results.length) {
             this.note('Expected ' + this._plan + ' tests but ran ' + this.results.length)
             this.success= false
+            this.actual_success= false
+         }
+         // A group is entirely skipped only if it explicitly skips its plan
+         // or every child is skipped. Failures always retain their failure UI.
+         if (!this.success)
+            this.skipped= false
+         else if (this.results.length) {
+            this.skipped= true
+            for (i= 0; i < this.results.length; i++)
+               if (!this.results[i].skipped) {
+                  this.skipped= false
+                  break
+               }
          }
          this.finished= true
       }
 
       // Add a pass/fail result
       TAP.prototype.add_result= function(result) {
+         var actual= result.actual_success == null? result.success : result.actual_success
+         if (this._todo !== undefined)
+            result.todo_reason= this._todo
+         var todo= result.todo_reason !== undefined
+         var success= result.success || todo
+         var reported= todo? actual : result.success
+         var status= result.skipped? 'skipped':!success? 'fail':!actual? 'todo':'pass'
+         var suffix= result.skipped? ' (skipped)' : todo || status === 'todo'
+            ? ' (TODO' + (todo && result.todo_reason? ': ' + result.todo_reason : '') + ')' : ''
          this.results.push(result)
-         var msg= (result.success? 'ok ':'not ok ') + this.results.length
+         var msg= (reported? 'ok ':'not ok ') + this.results.length
          if (result.message != null) msg+= ' - ' + result.message
+         if (todo) msg+= ' # TODO' + (result.todo_reason? ' ' + result.todo_reason : '')
          this.emit(msg, this.output_el == null? null
-            : _node('div', ['result', result.success?'pass':'fail'], [
-               _node('span', 'flag', result.success? 'ok':'not ok'),
+            : _node('div', ['result', status], [
+               _node('span', 'flag', reported? 'ok':'not ok'),
                _node('span', 'test-id', this.results.length),
-               _node('span', 'message', result.message != null ? result.message : ''),
+               _node('span', 'message', (result.message != null ? result.message : '') + suffix),
             ])
          )
          if (result.subtest_level) {
-            // automatically collapse passed subtests
-            if (result.output_el != null)
-               result.output_el.className += result.success? ' pass collapse':' fail'
+            // Collapse fully passed/skipped subtests; keep TODO failures visible.
+            if (result.output_el != null) {
+               result.output_el.className += ' ' + status + (status === 'pass' || status === 'skipped'? ' collapse' : '')
+               if (suffix)
+                  result.output_el.firstChild.appendChild(document.createTextNode(suffix))
+            }
             if (result.failed_count)
                this.note('Failed ' + result.failed_count + '/' + result.results.length + ' tests in subtest')
             if (result.exception != null)
                this.emit_exception(result.exception)
          }
-         if (!result.success) {
+         if (!actual)
+            this.actual_success= false
+         if (!success) {
             this.success= false
             this.failed_count++
          }
-         return result.success
+         return actual
       }
       // render an exception as DOM nodes.  TODO
       TAP.prototype.render_exception= function(e) {
@@ -239,6 +274,7 @@
          }
          catch(e) {
             this.success= false
+            this.actual_success= false
             if (this.subtest_level)
                this.exception= e
             else // need to log imediately because no caller will report the exception
@@ -254,6 +290,20 @@
          subtest.run(code)
          subtest.done_testing()
          return this.add_result(subtest)
+      }
+      // Scope TODO to synchronous assertions/subtests in this callback. Nested
+      // scopes restore their predecessor, even when the callback throws. Keep
+      // exceptions propagating so an unhandled callback error is still fatal.
+      TAP.prototype.todo= function(reason, code) {
+         if (typeof reason !== 'string' || typeof code !== 'function')
+            throw new TypeError('todo requires a reason and callback');
+         var previous= this._todo;
+         this._todo= reason.replace(/[\r\n]+/g, ' ');
+         try {
+            return code.call(this, this);
+         } finally {
+            this._todo= previous;
+         }
       }
       // declare a test passed
       TAP.prototype.pass= function(message) {

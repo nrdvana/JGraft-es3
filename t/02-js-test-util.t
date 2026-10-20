@@ -1,13 +1,22 @@
-//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -load => ['../src/JGraft.js', 'lib/jgraft-test-util.js'];
+//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -load => ['../src/JGraft.js', 'lib/test-util.js'];
 
 TAP(function(t) {
+   t.subtest('shared TestJS namespace', function(t) {
+      var namespace= TestJS, reader= TestJS.readFile;
+      // Re-evaluation must extend the host namespace without replacing its
+      // filesystem bridge (or its browser HTTP reader).
+      (0, eval)(reader('lib/test-util.js'));
+      t.ok(TestJS === namespace, 'preserves the namespace object');
+      t.ok(TestJS.readFile === reader, 'preserves the installed file reader');
+      t.is(typeof TestJS.runConformanceTests, 'function', 'exports the descriptive runner name');
+   });
    // Exercise the real TAP objects without emitting intentionally failing TAP
    // into this test's output. The captured results remain available to inspect.
    function capture(source, apply) {
       var root= new TAP(), emit= TAP.prototype.emit;
       TAP.prototype.emit= function() {};
       try {
-         JGraftTest.run(root, source, apply);
+         TestJS.runConformanceTests(root, source, apply);
       } finally {
          TAP.prototype.emit= emit;
       }
