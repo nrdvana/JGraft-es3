@@ -57,6 +57,8 @@ function equal(a, b) {
 
 // Keep original identities as well as values. A JSON clone would lose Dates,
 // and value equality alone would miss a replaced-but-equal input subtree.
+// Include prototype contents: old V8's JSON.parse makes "__proto__" a prototype
+// rather than an own property, so checking its identity alone misses mutations.
 function snapshot(value) {
    var result= {value: value}, i;
    if (value !== null && typeof value === "object") {
@@ -67,7 +69,7 @@ function snapshot(value) {
       if (result.tag === "[object Date]")
          result.time= Date.prototype.getTime.call(value);
       if (Object.getPrototypeOf)
-         result.prototype= Object.getPrototypeOf(value);
+         result.prototype= snapshot(Object.getPrototypeOf(value));
       for (i= 0; i < result.keys.length; i++)
          result.children.push(snapshot(value[result.keys[i]]));
    }
@@ -82,7 +84,7 @@ function unchanged(value, before) {
       return false;
    if (before.tag === "[object Date]" && !equal(Date.prototype.getTime.call(value), before.time))
       return false;
-   if (Object.getPrototypeOf && Object.getPrototypeOf(value) !== before.prototype)
+   if (Object.getPrototypeOf && !unchanged(Object.getPrototypeOf(value), before.prototype))
       return false;
    keys= Object.keys(value).sort();
    if (!equal(keys, before.keys))

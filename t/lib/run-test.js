@@ -112,6 +112,29 @@ if (browser) {
 } else
    global.TestJS= {readFile: readTestFile};
 
+// Compile separately so runtime SyntaxErrors never trigger this fallback.
+function runNodeScript(filename) {
+   var script;
+   try {
+      // The filename string also works before Node accepted an options object.
+      script= vm.createScript(fs.readFileSync(filename, "utf8"), filename);
+   } catch (error) {
+      var message= String(error.stack || error);
+      if (error.name !== "SyntaxError" || message.indexOf(filename) !== -1)
+         throw error;
+      // Node 0.10 only exposes parser locations through native stderr output.
+      // Compile without executing in a child so that output can be TAP comments.
+      require("child_process").execFile(process.execPath, ["-e",
+         'require("vm").createScript(require("fs").readFileSync(process.argv[1], "utf8"), process.argv[1], true)',
+         filename], function(childError, stdout, stderr) {
+            fail(stderr || message);
+         });
+      return false;
+   }
+   script.runInThisContext();
+   return true;
+}
+
 // External script injection preserves the real filename in browser errors.
 // Node's vm supplies the same filename without wrapping the source in a function.
 try {
@@ -120,11 +143,8 @@ try {
          currentScript= fs.absolute(scripts[i]);
          if (!page.injectJs(currentScript))
             fail("Cannot load script: " + scripts[i]);
-      } else {
-         vm.runInThisContext(fs.readFileSync(scripts[i], "utf8"), {
-            filename: scripts[i]
-         });
-      }
+      } else if (!runNodeScript(scripts[i]))
+         return;
    }
 } catch (error) {
    fail(error.stack || error);

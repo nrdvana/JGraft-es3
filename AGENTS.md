@@ -40,9 +40,16 @@ too heavily against the limits.
 The library should be made available as window.JGraft, which should be both a constructor and
 a namespace for global functions.
 
-JGraft permits arbitrary property names on objects, including `__PROTO__`.  An ES3 implementation
+JGraft permits arbitrary property names on objects, including `__proto__`.  An ES3 implementation
 will need to be continuously guarding against this, possibly just by using a helper function to
-read or write paths.
+read or write paths.  Additionally, old JS engines may have a JSON module that incorrectly adds
+external data to the prototype of an object when it contains a `__proto__` property.  We must
+guard against that by never using methods on objects that came from the input.
+
+  * Treat all input subtrees as external, including those moved into temporary storage.
+  * Read only own properties and use safe property-writing helpers.
+  * Call trusted built-in methods explicitly, never methods obtained from input objects.
+  * Keep internal bookkeeping separate from user-controlled properties.
 
 No operations should be inlined for speed in a parent function unless the size change to the code
 is negligible.  The library should have a collection of helper functions that perform most of the

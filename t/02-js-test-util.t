@@ -79,6 +79,18 @@ TAP(function(t) {
       failsMutation(t, 'detect Date mutation before an allowed error', {date: new Date(0)}, function(input) { input.date.setTime(1); }, true);
       failsMutation(t, 'detect nested mutation before an allowed error', {a: {b: 1}}, function(input) { input.a.b= 2; }, true);
       failsMutation(t, 'detect mutation under a special property name', JSON.parse('{"__proto__":{"x":1}}'), function(input) { input['__proto__'].x= 2; });
+      if (Object.getPrototypeOf) {
+         // Reproduce old V8's JSON.parse behavior on modern engines too.
+         var InheritedInput= function() {};
+         InheritedInput.prototype= {nested: {x: 1}};
+         t.ok(check(fixture(new InheritedInput(), 1), function() { return 1; }).success,
+            'an unchanged custom prototype remains unchanged');
+         failsMutation(t, 'detect mutation inside a custom prototype', new InheritedInput(),
+            function(input) { Object.getPrototypeOf(input).nested.x= 2; });
+         InheritedInput.prototype= {nested: {x: 1}};
+         failsMutation(t, 'detect replacement of an equal inherited subtree', new InheritedInput(),
+            function(input) { Object.getPrototypeOf(input).nested= {x: 1}; });
+      }
       t.ok(check(fixture({date: new Date(0)}, 1), function() { return 1; }).success, 'an unchanged Date remains unchanged');
       var result= check(fixture({a: 1}, 1), function(input) { input.a= 2; throw new Error('unexpected'); });
       t.ok(!result.results[0].results[0].success, 'input is checked even after an unclassified exception');

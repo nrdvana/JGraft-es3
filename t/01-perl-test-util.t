@@ -77,9 +77,18 @@ for my $engine (qw(phantomjs node)) {
       like($output, qr/\Q$file\E:3\b/, 'uncaught exception preserves filename and line');
 
       ($status, $output, $file)= run_fixture($engine, 'syntax',
-         "\nvar broken= ;\n");
+         "console.log('must not execute');\nvar broken= ;\n");
       isnt($status, 0, 'a syntax error fails');
       like($output, qr/\Q$file\E:3\b/, 'syntax error preserves filename and line');
+      unlike($output, qr/^[^#\r\n]/m, 'syntax diagnostics are all TAP comments');
+      unlike($output, qr/must not execute/, 'syntax diagnostics do not execute the script');
+
+      ($status, $output, $file)= run_fixture($engine, 'runtime syntax error',
+         "console.log('# executed once');\nthrow new SyntaxError('runtime error');\n");
+      isnt($status, 0, 'a runtime SyntaxError fails');
+      like($output, qr/\Q$file\E:3\b/, 'runtime SyntaxError preserves filename and line');
+      is(scalar(()= $output =~ /^# executed once$/mg), 1,
+         'a runtime SyntaxError does not rerun the script');
 
       ($status, $output)= run_fixture($engine, 'unfinished',
          "TAP(function(t) { t.pass('unfinished'); });\n", '', 100);
