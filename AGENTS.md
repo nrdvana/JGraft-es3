@@ -108,16 +108,115 @@ namespaces, but don't add a level of indent for this.
 
 ## Testing
 
-In the git submodule "jgraft-spec" there is a directory "conformance" that contains standard
-examples and a `README.md` that describes them.  Testing should include all of those, and then
-additional tests local to this implementation for things like Date objects.  The tests will
-initially be run on PhantomJS, which is nominally ES5, but eventually run on an old checkout of
-that project that more closely resembles the target ES3 feature set.
+The suite is self-contained Perl TAP plus JavaScript; no npm packages are required.
+The `jgraft-spec` git submodule supplies the specification and JSON fixtures in
+`jgraft-spec/conformance`. Read its `README.md` before adding fixtures. Initialize the
+submodule with `git submodule update --init` if it is missing.
 
-To avoid depending on any of the Node.js ecosystem I have added an implementation of perl's TAP
-protocol at t/lib/tap.js and a harness to run other tests in that environment at
-t/lib/run-test.js and a perl wrapper t/lib/TestJS.pm which can launch phantomjs as a one-liner
-like:
+From the repository root:
 
-    //; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -js => <<'//END.JS';
+    prove
+    TESTJS=node prove
+    TESTJS=all prove
+    TESTJS=all prove -v t/21-copy.t
+
+With TESTJS unset or empty, PhantomJS is preferred and Node is the fallback. An explicit
+engine selection never falls back. `TESTJS=all` launches PhantomJS and Node concurrently
+and re-emits their captured output as sequential TAP subtests in that order. It means
+those two executable names, not every installed engine version. `TESTJS_TIMEOUT` is a
+per-engine timeout in milliseconds (default 10000); Perl's watchdog also interrupts tight
+synchronous loops. Paths are resolved independently of the working directory; from
+elsewhere, use e.g. `prove /absolute/path/to/JGraft-es3/t`.
+
+The Dockerfile installs PhantomJS 1.9.2 at `/usr/local/bin/phantomjs` and Node 0.10.48
+at `/opt/node-0.10/bin/node`, with `/usr/local/bin/node-0.10` as a convenience symlink.
+The legacy Node download is checksum-verified and only its binary is installed, without
+npm. Both archived engine downloads target Linux x86-64. Legacy Node does not replace
+the normal `node` executable. Select it by prepending its directory to PATH:
+
+    PATH=/opt/node-0.10/bin:$PATH TESTJS=node prove
+    PATH=/opt/node-0.10/bin:$PATH TESTJS=node prove t/10-api.t t/21-copy.t
+
+The second command checks the API and implementation without the known JSON-parser
+failure described below. `TESTJS=node-0.10` is not a supported selection; the harness
+launches the `node` found in PATH. Prefixing PATH also changes the Node used by
+`TESTJS=all` and by the harness's own engine regression tests.
+
+### Test files and helper APIs
+
+| File | Purpose |
+| --- | --- |
+| `t/00-load.t` | Library loading |
+| `t/01-perl-test-util.t` | Engine selection, paths/line numbers, parallel execution, timeout/reaping |
+| `t/02-js-test-util.t` | Conformance helper, comparison, mutation detection, fixture/error handling |
+| `t/03-serve-tests.t` | Optional HTTP server security and browser rendering |
+| `t/04-tap.t` | Scoped TODO semantics and browser presentation |
+| `t/10-api.t` | Constructor/apply API, counters, partial errors, reuse |
+| `t/20-act-basic.t` | COPY/MOVE/SPLICE conformance and pending Date cases |
+| `t/21-copy.t` | COPY ownership, Dates, prototype safety, scopes, resource limits |
+
+Most `.t` files are original JavaScript preceded by one Perl-compatible line:
+
+    //; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -load => '../src/JGraft.js';
+
+`-load` accepts one path or an array of paths, relative to the test file. The wrapper
+`t/lib/TestJS.pm` launches `t/lib/run-test.js`, which preloads `tap.js` and executes the
+original test file to preserve filenames and line numbers. Literal `-js` heredocs are
+supported for compatibility but are not needed for new tests. Plain Perl tests run
+normally through prove.
+
+Use `TAP(function(t) { ...; t.done_testing(); });` and `t.subtest(name, callback)`.
+`t.todo(reason, callback)` scopes expected failures to a synchronous callback, including
+its subtests. Those failures emit `# TODO`, render yellow, and do not fail the suite;
+failures outside the scope still count. Entirely skipped subtests render grey.
+
+Load `lib/test-util.js` for `TestJS.runConformanceTests(t, fileOrSuite[, apply])`.
+Its default adapter calls `new JGraft(graft, {limits: limits}).apply(input)`. An override
+receives `(input, graft, limits)` for testing the helper independently. The helper checks
+input identity and values (including Dates and prototype contents) after both successful
+and failed applications, and validates permitted error codes. Fixture RESOURCE_LIMIT
+flags require a resource failure even if output is also provided. `TestJS.readFile`
+resolves fixture paths relative to the test; ordinary browsers use synchronous XHR.
+
+COPY's 121 standard cases currently run as ordinary tests. MOVE, SPLICE, and their
+Date cases remain explicitly TODO until implemented. Do not hide new COPY failures in
+those TODO scopes. Read `README.md` for the current implementation subset, constructor
+ownership contract, configuration, and resource-counter semantics. Tests should check
+budgets and ownership behavior rather than depend on exact counter totals.
+
+### Old-engine quirks
+
+Node 0.10's native JSON parser puts `"__proto__"` data into the actual prototype instead
+of an own property. With that parser, the full suite currently has one known COPY
+fixture failure: `Write arbitrary object property names` in `t/20-act-basic.t`, because
+the expected JSON output loses that property while JGraft correctly creates an own
+data property. A conforming replacement JSON parser is needed for that fixture and
+for applications needing arbitrary JSON keys. Do not fix the mismatch by treating
+inherited properties as data, changing the fixture, or weakening output comparison.
+
+Old V8 can also ignore an own `__proto__` data property during bracket reads, and old
+JavaScriptCore can report the magic accessor as an own property. Use descriptors to
+inspect actual data properties when debugging these cases; use the library's own
+property helpers in implementation code. A bare hasOwnProperty or bracket read is not
+sufficient across the supported engines.
+
+Keep Node VM filenames as strings: Node 0.10 coerces an options object to the filename
+`[object Object]`. Its caught syntax errors omit source locations; the runner's fallback
+uses a compile-only child to capture native diagnostics as TAP comments without rerunning
+test code. PhantomJS 1.9 also omits syntax-error traces; its fallback reparses without
+executing. Preserve the harness regression tests when changing either path.
+
+### Manual browser testing
+
+`t/serve-tests` is an optional Mojolicious::Lite app; Mojolicious is not a dependency
+of the normal suite. Server regression tests skip when it is unavailable. For example:
+
+    t/serve-tests daemon -l 'http://*:3000'
+
+The server root is the repository. `/` lists test links, and `/t/*.t` URLs render HTML
+around the original JavaScript; `?raw=1` returns source. Only Git-known files are served,
+including tracked submodule files, with no other directory indexes. Newly created files
+must be added to Git's index before they can be fetched. Do not bypass that restriction
+to make local browser testing work. Browser behavior lives in `tap.js`, `tap.css`, and
+`test-util.js`, shared with the headless tests.
 
