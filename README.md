@@ -21,7 +21,10 @@ construction; application options are borrowed for the synchronous call.
 `apply` does not modify its input. Changed ancestors are shallow-cloned once,
 while untouched input subtrees can be shared with the result. COPY constructs
 new values and deep-copies referenced objects, arrays, and native Dates. The
-`clone` option additionally detaches any untouched shared subtrees. Shared
+MOVE action transfers values and their ownership markers without traversing
+the moved subtree. SPLICE materializes its replacement values before editing
+the target array, while surviving elements can remain shared with the input.
+The `clone` option additionally detaches any untouched shared subtrees. Shared
 objects remain mutable in JavaScript: callers wanting independent ownership
 of the entire result should request cloning.
 
@@ -48,11 +51,22 @@ diagnostic trees are not defensively cloned. Paths inside temporary or constant
 namespaces describe the location in that namespace. Invalid resource
 configuration throws a `TypeError` during construction.
 
-Currently implemented: COPY, JGRAFT scopes, AT, NODE/TEMP/STASH/CONST/CAP
-references, EXPR expansion, LOCAL, LENGTH, and FAIL. LENGTH counts JavaScript
-UTF-16 code units. Native Dates can be copied; the specification's other date
-operations and virtual date properties are pending. MOVE, SPLICE, matching,
-and the remaining expressions are still pending.
+During MOVE, array deletions and half-index insertions are deferred until the
+action finishes. If it fails before final rebuilding, pending deletions appear
+as `null` at their original positions in `partial`, and queued half-index
+insertions are omitted.
+SPLICE evaluates every replacement before changing its target. A resource
+failure while committing an edit can still leave a partially edited result.
+
+Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT,
+NODE/TEMP/STASH/CONST/CAP references, EXPR expansion, LOCAL, NOT, LENGTH,
+SLICE, CONCAT, and FAIL. There is supporting SPLIT action/expression and JOIN
+expression behavior for literal separators/trimming and ANY lists of literal
+alternatives, including separator/trim metadata carried by array edits.
+The full SPLIT regex language and its `keep`/`element` options are pending;
+matching actions and the remaining expressions are also pending.
+LENGTH counts JavaScript UTF-16 code units. Native Dates can be copied; the specification's other date
+operations and virtual date properties are pending.
 
 ## Engine and JSON requirements
 
@@ -75,8 +89,10 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. COPY conformance cases and local implementation
-tests are active; pending MOVE and SPLICE tests are marked TODO.
+`all` runs both in parallel. All 444 COPY/MOVE/SPLICE conformance cases and
+the local implementation tests are active without TODO markers. Node 0.10's
+native JSON parser causes four known conformance failures involving
+`__proto__`; the descriptor-built local ownership and property tests pass.
 
 The optional Mojolicious app `t/serve-tests daemon -l http://*:3000` serves the
 Git-tracked repository files and browser test pages. Mojolicious is not needed
