@@ -71,6 +71,9 @@
          this.failed_count= 0
          this.prefix= ''
          this.subtest_level= 0
+         this.subtestPath= []
+         this.subtestFilter= null
+         this._subtestSelected= false
          if (!arguments.length) {
             if (use_dom_output)
                this.output_el= _node('div', ['tap-output','root'], '')
@@ -78,6 +81,9 @@
          else if (arguments.length == 2) {
             var parent= arguments[0]
             this._todo= parent._todo
+            this.subtestPath= parent.subtestPath.concat(String(arguments[1]))
+            this.subtestFilter= parent.subtestFilter
+            this._subtestSelected= parent._subtestSelected
             this.name= arguments[1]
             this.message= 'Subtest: ' + this.name
             this.prefix= parent.prefix + '    '
@@ -125,32 +131,189 @@
          return ''+content
       }
 
-      TAP.deep_compare= function(a, b) {
-         if (a === null)
-            return b === null
-         if (typeof a != typeof b)
-            return false
-         if (typeof a != 'object')
-            return a == b
-         if (Array.isArray(a)) {
-            if (!Array.isArray(b))
-               return false
-            if (a.length != b.length)
-               return false
-            for (var i= a.length-1; i >= 0; i--)
-               if (!TAP.deep_compare(a[i], b[i]))
-                  return false
-            return true
+      var own= Object.prototype.hasOwnProperty;
+      var objectTag= Object.prototype.toString;
+      var descriptor= Object.getOwnPropertyDescriptor;
+      var dateTime= Date.prototype.getTime;
+      var regexpString= RegExp.prototype.toString;
+      var functionString= Function.prototype.toString;
+
+      // Read descriptors rather than calling accessors, and avoid old V8's
+      // broken bracket reads of own __proto__ data properties.
+      var ownDescriptor= function(value, key) {
+         return descriptor? descriptor(value, key) : {value: value[key]};
+      };
+      var kind= function(value) {
+         return value === null? 'null' : typeof value === 'object'
+            ? objectTag.call(value) : typeof value;
+      };
+      var sameScalar= function(a, b) {
+         return a === b || a !== a && b !== b;
+      };
+      var pathText= function(path) {
+         var text= '$', i;
+         for (i= 0; i < path.length; i++)
+            text+= '[' + JSON.stringify(path[i]) + ']';
+         return text;
+      };
+
+      var arrayIndex= function(key, length) {
+         var index= Number(key);
+         return index >= 0 && index < length && Math.floor(index) === index && String(index) === key;
+      };
+
+      // Stable, bounded diagnostics without invoking user toJSON or getters.
+      // Sparse slots, special numbers, Dates, and cycles remain distinguishable.
+      TAP.format= function(value, maximum) {
+         var remaining= maximum === undefined? 4096 : maximum, truncated= false, text= '', parents= [], paths= [];
+         function write(part) {
+            if (part.length > remaining) truncated= true;
+            if (remaining > 0) {
+               text+= part.slice(0, remaining);
+               remaining-= part.length;
+            }
          }
-         var a_keys= Object.keys(a).sort()
-         var b_keys= Object.keys(b).sort()
-         if (!TAP.deep_compare(a_keys, b_keys))
-            return false
-         for (var i= a_keys.length-1; i >= 0; i--)
-            if (!TAP.deep_compare(a[a_keys[i]], b[a_keys[i]]))
-               return false
-         return true
-      }
+         function property(value, key, path) {
+            var d= ownDescriptor(value, key);
+            if (own.call(d, 'value'))
+               visit(d.value, path);
+            else
+               write('[Accessor' + (d.get? ' get: ' + JSON.stringify(functionString.call(d.get)) : '')
+                  + (d.set? ' set: ' + JSON.stringify(functionString.call(d.set)) : '') + ']');
+         }
+         function visit(value, path) {
+            var type= kind(value), keys, extras, key, i;
+            if (value === null || typeof value !== 'object') {
+               write(typeof value === 'string'? JSON.stringify(value)
+                  : typeof value === 'function'? '[Function ' + JSON.stringify(functionString.call(value)) + ']'
+                  : String(value));
+               return;
+            }
+            for (i= 0; i < parents.length; i++)
+               if (parents[i] === value) {
+                  write('[Circular ' + pathText(paths[i]) + ']');
+                  return;
+               }
+            if (parents.length >= 32) {
+               write('[Depth limit]');
+               return;
+            }
+            parents.push(value);
+            paths.push(path);
+            if (type === '[object Date]')
+               write('Date(' + dateTime.call(value) + ')');
+            else if (type === '[object RegExp]')
+               write(regexpString.call(value));
+            keys= Object.keys(value).sort();
+            if (type === '[object Array]') {
+               write('[');
+               for (i= 0; i < value.length && remaining > 0; i++) {
+                  if (i) write(', ');
+                  if (own.call(value, i)) property(value, String(i), path.concat(i));
+                  else write('<hole>');
+               }
+               write(']');
+               extras= [];
+               for (i= 0; i < keys.length; i++) {
+                  key= keys[i];
+                  if (!arrayIndex(key, value.length))
+                     extras.push(key);
+               }
+               keys= extras;
+            }
+            if (keys.length || type !== '[object Array]' && type !== '[object Date]' && type !== '[object RegExp]') {
+               write('{');
+               for (i= 0; i < keys.length && remaining > 0; i++) {
+                  if (i) write(', ');
+                  key= keys[i];
+                  write(JSON.stringify(key) + ': ');
+                  property(value, key, path.concat(key));
+               }
+               write('}');
+            }
+            parents.pop();
+            paths.pop();
+         }
+         visit(value, []);
+         return text + (truncated? ' ... [truncated]' : '');
+      };
+
+      // Compare all branches, stopping at a node whose type, own enumerable
+      // keys, array length, accessor, or scalar value differs. An explicit work
+      // stack avoids recursion limits; ancestor pairs terminate cyclic input.
+      var differences= function(a, b, report, maximum) {
+         var pending= [{a: a, b: b, path: [], parent: null}], count= 0;
+         var node, type, keys, other, i, parent, left, right, reason, cyclic;
+         while (pending.length && count < maximum) {
+            node= pending.pop();
+            a= node.a; b= node.b;
+            if (sameScalar(a, b)) continue;
+            type= kind(a);
+            reason= type !== kind(b)? 'type' : null;
+            if (!reason && (a === null || typeof a !== 'object'))
+               reason= 'value';
+            if (!reason && type === '[object Date]' && !sameScalar(dateTime.call(a), dateTime.call(b))
+                  || !reason && type === '[object RegExp]' && regexpString.call(a) !== regexpString.call(b))
+               reason= 'value';
+            if (!reason) {
+               keys= Object.keys(a).sort();
+               other= Object.keys(b).sort();
+               if (type === '[object Array]' && a.length !== b.length)
+                  reason= 'length';
+               if (keys.length !== other.length)
+                  reason= 'properties';
+               for (i= 0; i < keys.length && !reason; i++) {
+                  if (keys[i] !== other[i]) reason= 'properties';
+                  else {
+                     left= ownDescriptor(a, keys[i]); right= ownDescriptor(b, keys[i]);
+                     if (own.call(left, 'value') !== own.call(right, 'value')
+                           || left.get !== right.get || left.set !== right.set)
+                        reason= 'accessors';
+                  }
+               }
+            }
+            if (reason) {
+               count++;
+               if (report) report(node.path, a, b, reason, count);
+               continue;
+            }
+            cyclic= false;
+            for (parent= node.parent; parent; parent= parent.parent)
+               if (parent.a === a && parent.b === b) { cyclic= true; break; }
+            if (cyclic) continue;
+            for (i= keys.length - 1; i >= 0; i--) {
+               left= ownDescriptor(a, keys[i]); right= ownDescriptor(b, keys[i]);
+               if (own.call(left, 'value'))
+                  pending.push({a: left.value, b: right.value, parent: node,
+                     path: node.path.concat(type === '[object Array]' && arrayIndex(keys[i], a.length)
+                        ? Number(keys[i]) : keys[i])});
+            }
+         }
+         return count;
+      };
+
+      TAP.deep_compare= function(a, b) {
+         return differences(a, b, null, 1) === 0;
+      };
+
+      // Diagnostic only: it creates no assertions and changes no TAP status.
+      // Arguments are old/expected then new/actual. Return the number printed;
+      // an optional maximum defaults to 20, with an explicit truncation notice.
+      TAP.prototype.noteDifferences= function(a, b, maximum) {
+         var self= this, limit= maximum === undefined? 20 : maximum;
+         if (typeof limit !== 'number' || limit < 0 || Math.floor(limit) !== limit)
+            throw new TypeError('Difference limit must be a nonnegative integer or Infinity');
+         var count= differences(a, b, function(path, oldValue, newValue, reason, index) {
+            if (index > limit) {
+               self.note('Further differences omitted');
+               return;
+            }
+            self.note('Difference at ' + pathText(path) + ' (' + reason + ')');
+            self.note('  old: ' + TAP.format(oldValue));
+            self.note('  new: ' + TAP.format(newValue));
+         }, limit + 1);
+         return Math.min(count, limit);
+      };
 
       // Emit a line of TAP syntax at current indent level
       TAP.prototype.emit= function(text, node) {
@@ -283,14 +446,40 @@
          TAP.current= prev
          return this
       }
-      // run a function of test script as a subtest
-      TAP.prototype.subtest= function(name, code) {
-         var subtest= new TAP(this, name)
-         this.emit('# Subtest: ' + name) // only emit text
-         subtest.run(code)
-         subtest.done_testing()
-         return this.add_result(subtest)
-      }
+      // Select named groups by their name or complete "suite / case" path. Once a
+      // group matches, execute all its descendants. Empty patterns disable it.
+      TAP.prototype.filterSubtests= function(pattern) {
+         try {
+            this.subtestFilter= pattern == null || pattern === ''? null : new RegExp(pattern);
+         } catch (error) {
+            throw new Error('Invalid subtest filter: ' + error.message);
+         }
+         this._subtestSelected= false;
+         this.note('Subtest filter: ' + TAP.format(pattern));
+         return this;
+      };
+
+      // Containers discover descendants even when their own name does not
+      // match. Other unmatched callbacks are never invoked; keep a real SKIP
+      // plan and the original sibling numbering in both TAP and browser output.
+      TAP.prototype.subtest= function(name, code, options) {
+         var subtest= new TAP(this, name), filter= subtest.subtestFilter;
+         this.emit('# Subtest: ' + name);
+         if (filter && !subtest._subtestSelected) {
+            filter.lastIndex= 0;
+            subtest._subtestSelected= filter.test(String(name));
+            if (!subtest._subtestSelected) {
+               filter.lastIndex= 0;
+               subtest._subtestSelected= filter.test(subtest.subtestPath.join(' / '));
+            }
+         }
+         if (filter && !subtest._subtestSelected && !(options && options.container))
+            subtest.plan(0, 'Filtered out by subtest filter');
+         else
+            subtest.run(code);
+         subtest.done_testing();
+         return this.add_result(subtest);
+      };
       // Scope TODO to synchronous assertions/subtests in this callback. Nested
       // scopes restore their predecessor, even when the callback throws. Keep
       // exceptions propagating so an unhandled callback error is still fatal.
@@ -315,12 +504,14 @@
       }
       // check two values for equality
       TAP.prototype.is= function(actual, expected, message) {
-         return this.add_result({
+         var success= this.add_result({
             success: TAP.deep_compare(actual, expected),
             actual: actual,
             expected: expected,
             message: message
-         })
+         });
+         if (!success) this.noteDifferences(expected, actual);
+         return success;
       }
       // check a value for boolean truth
       TAP.prototype.ok= function(success, message) {

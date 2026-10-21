@@ -17,7 +17,7 @@ if (typeof module !== "undefined" && module.exports)
 // Keep argument parsing, TAP diagnostics and completion polling identical in
 // both engines. readState bridges the Phantom page or reads Node's TAP root.
 TestJGraft.createRunner= function(args, finish, readState) {
-   var scripts= [], timeout= 10000, startTime= new Date().getTime(), i, match;
+   var scripts= [], timeout= 10000, subtests, startTime= new Date().getTime(), i, match;
    function diagnostic(message) {
       console.log(String(message).replace(/^/gm, "# "));
    }
@@ -39,12 +39,14 @@ TestJGraft.createRunner= function(args, finish, readState) {
       match= /^--timeout=([1-9][0-9]*)$/.exec(args[i]);
       if (match)
          timeout= Number(match[1]);
+      else if (args[i].indexOf("--subtests=") === 0)
+         subtests= args[i].slice(11);
       else
          scripts.push(args[i]);
    }
    if (!scripts.length)
-      fail("Usage: engine run-ENGINE.js [--timeout=MS] tap.js [library.js ...] test.t");
-   return {scripts: scripts, testFile: scripts[scripts.length - 1],
+      fail("Usage: engine run-ENGINE.js [--timeout=MS] [--subtests=PATTERN] tap.js [library.js ...] test.t");
+   return {scripts: scripts, subtests: subtests, testFile: scripts[scripts.length - 1],
       diagnostic: diagnostic, fail: fail, pollFinished: pollFinished};
 };
 
@@ -72,26 +74,19 @@ function tag(value) {
    return objectTag.call(value);
 }
 
-// Compare JSON/Date values without serializing away Date types or special keys.
-// Object key order is irrelevant; arrays retain their length and own properties.
+// Reuse TAP's descriptor-aware comparison, including arbitrary own keys.
 function equal(a, b) {
-   var keys, other, i;
-   if (a === null || b === null || typeof a !== "object" || typeof b !== "object")
-      return a === b || (a !== a && b !== b);
-   if (tag(a) !== tag(b))
-      return false;
-   if (tag(a) === "[object Date]" && !equal(Date.prototype.getTime.call(a), Date.prototype.getTime.call(b)))
-      return false;
-   if (tag(a) === "[object Array]" && a.length !== b.length)
-      return false;
-   keys= Object.keys(a).sort();
-   other= Object.keys(b).sort();
-   if (keys.length !== other.length)
-      return false;
-   for (i= 0; i < keys.length; i++)
-      if (keys[i] !== other[i] || !equal(a[keys[i]], b[keys[i]]))
-         return false;
-   return true;
+   return global.TAP.deep_compare(a, b);
+}
+
+// Snapshot/path reads must also bypass old V8's own __proto__ bracket bug.
+function get(value, key) {
+   var d;
+   if (key === "__proto__" && Object.getOwnPropertyDescriptor) {
+      d= Object.getOwnPropertyDescriptor(value, key);
+      return d && d.value;
+   }
+   return value[key];
 }
 
 // Keep original identities as well as values. A JSON clone would lose Dates,
@@ -110,7 +105,7 @@ function snapshot(value) {
       if (Object.getPrototypeOf)
          result.prototype= snapshot(Object.getPrototypeOf(value));
       for (i= 0; i < result.keys.length; i++)
-         result.children.push(snapshot(value[result.keys[i]]));
+         result.children.push(snapshot(get(value, result.keys[i])));
    }
    return result;
 }
@@ -129,7 +124,7 @@ function unchanged(value, before) {
    if (!equal(keys, before.keys))
       return false;
    for (i= 0; i < keys.length; i++)
-      if (!unchanged(value[keys[i]], before.children[i]))
+      if (!unchanged(get(value, keys[i]), before.children[i]))
          return false;
    return true;
 }
@@ -141,13 +136,56 @@ function note(t, value) {
       t.note(lines[i]);
 }
 
-function describe(value) {
-   try {
-      return tag(value) + " " + JSON.stringify(value);
-   } catch (error) {
-      return String(value);
+// Optional context is a fixture-like object with input, jgraft, output/errors.
+// Paths may describe missing nodes or expanded expressions: report the nearest
+// physical ancestor rather than pretending the original tree contains them.
+TestJGraft.noteError= function(t, error, context) {
+   var fields= ["graftPath", "inputPath", "resource", "counts", "limits"], i, key;
+   function show(label, value) {
+      note(t, label + ": " + global.TAP.format(value));
    }
-}
+   function location(label, value, path) {
+      var i, d, prefix= [];
+      if (tag(path) !== "[object Array]") return;
+      for (i= 0; i < path.length; i++) {
+         if (value === null || typeof value !== "object" || !owns(value, path[i])) {
+            show(label + " missing; nearest path", prefix);
+            show(label + " nearest subtree", value);
+            return;
+         }
+         d= Object.getOwnPropertyDescriptor? Object.getOwnPropertyDescriptor(value, path[i]) : null;
+         prefix.push(path[i]);
+         if (d && !owns(d, "value")) {
+            show(label + " accessor at path", prefix);
+            show(label + " containing subtree", value);
+            return;
+         }
+         value= d? d.value : get(value, path[i]);
+      }
+      show(label, value);
+   }
+   if (error === null || typeof error !== "object") {
+      show("Thrown", error);
+      return;
+   }
+   note(t, (error.name || "Error") + (error.code? " " + error.code : "")
+      + (error.message? ": " + global.TAP.format(error.message) : ""));
+   for (i= 0; i < fields.length; i++) {
+      key= fields[i];
+      if (owns(error, key)) show(key, get(error, key));
+   }
+   if (context) {
+      if (owns(context, "output")) show("Expected output", context.output);
+      if (context.errors) show("Allowed errors", context.errors);
+      if (owns(context, "jgraft")) location("Graft at recorded path", context.jgraft, error.graftPath);
+      if (owns(context, "input")) location("Original input at recorded path", context.input, error.inputPath);
+   }
+   if (owns(error, "partial")) {
+      show("Partial output", error.partial);
+      location("Partial output at recorded path", error.partial, error.inputPath);
+   }
+   if (error.stack) note(t, error.stack);
+};
 
 function runCase(t, test, apply, forbidProto) {
    t.subtest(test.name, function(t) {
@@ -177,14 +215,13 @@ function runCase(t, test, apply, forbidProto) {
          if (!t.ok(typeof code === "string" && owns(allowed, code) && allowed[code] === true
                && (!mustLimit || code === "RESOURCE_LIMIT"),
                "error is permitted: " + (code || "unclassified exception")))
-            note(t, error && error.stack || error);
+            TestJGraft.noteError(t, error, test);
       } else if (mustLimit) {
          t.fail("Expected RESOURCE_LIMIT");
       } else if (!owns(test, "output")) {
          t.fail("Expected an error");
       } else if (!t.ok(equal(output, test.output), "output matches")) {
-         note(t, "Expected: " + describe(test.output));
-         note(t, "Actual: " + describe(output));
+         t.noteDifferences(test.output, output);
       }
    });
 }
@@ -194,8 +231,61 @@ function applyGraft(input, graft, limits) {
    return new global.JGraft(graft, {limits: limits}).apply(input);
 }
 
+// Count fixtures, rather than their assertions or enclosing engine/suite groups.
+// Defer until root completion so TODO scopes on enclosing groups are available.
+function installConformanceSummary() {
+   var original= global.TAP.prototype.done_testing;
+   if (original._jgraftSummary) return;
+   function done(count) {
+      original.call(this, count);
+      if (!this.subtest_level && !this._jgraftSummaryPrinted) {
+         this._jgraftSummaryPrinted= true;
+         conformanceSummary(this);
+      }
+   }
+   done._jgraftSummary= true;
+   global.TAP.prototype.done_testing= done;
+}
+
+function conformanceSummary(root) {
+   var total= [0, 0, 0, 0, 0, 0, 0], suites= 0;
+   function report(label, counts) {
+      root.note(label + ': ' + counts[0] + ' cases; ' + counts[1] + ' passed, '
+         + counts[2] + ' failed, ' + counts[3] + ' skipped, '
+         + counts[4] + ' TODO failed, ' + counts[5] + ' TODO passed (unexpected), '
+         + counts[6] + ' not run');
+   }
+   function visit(test, todo) {
+      var counts, i, j, child, category;
+      todo= todo || test.todo_reason !== undefined || test._todo !== undefined;
+      if (test._jgraftCaseCount !== undefined) {
+         suites++;
+         counts= [test._jgraftCaseCount, 0, 0, 0, 0, 0, 0];
+         // A missing implementation skips the entire suite without creating cases.
+         if (test.skipped && !test.results.length)
+            counts[3]= counts[0];
+         else for (i= 0; i < test.results.length; i++) {
+            child= test.results[i];
+            category= child.skipped? 3
+               : todo || child.todo_reason !== undefined || (child.success && !child.actual_success)
+               ? child.actual_success? 5 : 4
+               : child.success? 1 : 2;
+            counts[category]++;
+         }
+         if (!test.skipped) counts[6]= counts[0] - test.results.length;
+         for (j= 0; j < counts.length; j++) total[j]+= counts[j];
+         report('Conformance ' + global.TAP.format(test.subtestPath.join(' / ')), counts);
+      } else if (test.results) {
+         for (i= 0; i < test.results.length; i++) visit(test.results[i], todo);
+      }
+   }
+   visit(root, false);
+   if (suites) report('Conformance total', total);
+}
+
 function runConformanceTests(t, source, apply) {
    var suite, i, forbidProto;
+   installConformanceSummary();
    try {
       suite= typeof source === "string"? JSON.parse(TestJGraft.readFile(source)) : source;
       if (!suite || suite.version !== 1 || typeof suite.name !== "string"
@@ -209,6 +299,7 @@ function runConformanceTests(t, source, apply) {
       return;
    }
    t.subtest(suite.name, function(t) {
+      t._jgraftCaseCount= suite.tests.length;
       if (!apply && (typeof global.JGraft !== "function" || typeof global.JGraft.prototype.apply !== "function")) {
          t.plan(0, "JGraft.prototype.apply is not implemented");
          return;
@@ -216,7 +307,7 @@ function runConformanceTests(t, source, apply) {
       forbidProto= !apply && new global.JGraft(["JGRAFT", {v: 1}]).forbidProto;
       for (i= 0; i < suite.tests.length; i++)
          runCase(t, suite.tests[i], apply || applyGraft, forbidProto);
-   });
+   }, {container: true});
 }
 
 TestJGraft.runConformanceTests= runConformanceTests;

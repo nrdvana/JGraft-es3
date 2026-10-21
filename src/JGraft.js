@@ -15,7 +15,7 @@ var surrogatePair= /[\uD800-\uDBFF][\uDC00-\uDFFF]/;
 var defaults= {mem: 67108864, ops: 1000000, new_obj: 100000, depth: 128};
 var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6};
 var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
-   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6,
+   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, STR: 8, SEQ: 13, START: 17, END: 18,
    LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, FAIL: 67};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
 // Checking an inherited sentinel also works when descriptors are unavailable.
@@ -861,6 +861,7 @@ function borrow(state, expression, scope, depth) {
 // and writes to data subsequently returned by an expression still copy it.
 function valueScope(state, scope, value) {
    var result= scopeCopy(state, scope);
+   result.regex= null;
    result.node= make(state);
    result.node.tree= holder(state, value, false);
    result.node.keys= make(state, true);
@@ -870,9 +871,18 @@ function valueScope(state, scope, value) {
 // Probe errors mean false; syntax/resource errors and application exceptions
 // escape. Discard diagnostic path segments left by a failed argument walk so
 // another alternative or a later action gets its own correct location.
-function match(state, expression, scope, depth, mode, target) {
+// element bypasses regex entry when a cursor is already positioned. Inner
+// function matches retain regex context, but restore the calling character.
+function match(state, expression, scope, depth, mode, target, element) {
    var pathLength= state.graftPath.length, inputPath= state.inputPath;
+   var regex= !element && !target && scope.regex, position= regex && regex.position, result;
    try {
+      if (regex) {
+         result= sequenceTerm(state, expression, scope, depth,
+            position * 32 + 16 + (mode || 0), regex);
+         sequencePosition(state, regex, position);
+         return result >= 0;
+      }
       return matchValue(state, expression, scope, depth, mode || 0, target);
    } catch (error) {
       if (!error || error.counts !== state.counts
@@ -881,8 +891,127 @@ function match(state, expression, scope, depth, mode, target) {
       state.graftPath.length= pathLength;
       state.inputPath= inputPath;
       state.element= null;
+      if (regex)
+         sequencePosition(state, regex, position);
       return false;
    }
+}
+
+// A sequence cursor borrows an array location or a string index. Its element
+// scope is reused; a virtual one-slot array makes end-of-string genuinely
+// missing (including for EXISTS and references), without decoding an array.
+function sequenceCursor(state, scope, value) {
+   var cursor= make(state);
+   cursor.scope= scopeCopy(state, scope);
+   cursor.scope.node= make(state);
+   cursor.info= typeof value === "string"? stringInfo(state, value) : null;
+   cursor.value= cursor.info? make(state, true) : value;
+   if (cursor.info)
+      cursor.scope.regex= cursor;
+   cursor.scope.node.tree= cursor.info? holder(state, cursor.value, false) : scope.node.tree;
+   charge(state, scope.node.keys.length, 32 + scope.node.keys.length * 8, 1);
+   cursor.scope.node.keys= cursor.info? [] : scope.node.keys.slice(0);
+   cursor.scope.node.keys.push(0);
+   return cursor;
+}
+
+// Position one cursor without allocating per-element scopes. Return whether
+// the position is at the end; indices beyond it cannot generate successors.
+function sequencePosition(state, cursor, position) {
+   var offset;
+   charge(state, 1);
+   cursor.position= position;
+   if (cursor.info) {
+      offset= stringOffset(state, cursor.info, position);
+      if (offset < cursor.info.text.length)
+         cursor.value[0]= character(cursor.info, offset);
+      else if (owns(cursor.value, 0))
+         delete cursor.value[0];
+      return offset >= cursor.info.text.length;
+   }
+   cursor.scope.node.keys[cursor.scope.node.keys.length - 1]= position;
+   return position >= cursor.value.length;
+}
+
+// Generate the single successor for the currently supported deterministic
+// terms, or -1 on failure. Keep sequence composition separate from element
+// matching so REP/alternatives can later enumerate multiple successors here.
+// options packs the position above four mode bits and an active-sequence bit.
+// This scalar avoids allocating state objects during unanchored searches.
+function sequenceTerm(state, expression, scope, depth, options, cursor) {
+   var position= Math.floor(options / 32), mode= options & 15, kind= type(expression);
+   var id= null, next, offset, end, info;
+   charge(state, 1, 0, 0, depth);
+   end= sequencePosition(state, cursor, position);
+   scope= cursor.scope;
+   if (cursor.info? cursor.info.length !== null && position > cursor.info.length
+         : position > cursor.value.length)
+      return -1;
+   if (!(mode & 2)) {
+      id= kind === "array" && !(expression.length === 1 && type(get(expression, 0)) === "array")
+         ? operation(state, expression, expressions) : null;
+      if (id === -5) {
+         options= position * 32 + (mode | 4) + (options & 16);
+         return sequenceTerm(state, macro(state, expression, scope, depth), scope, depth + 1, options, cursor);
+      }
+      if (id === 13) {
+         arity(state, expression, 1, Infinity);
+         return sequenceTerms(state, expression, scope, depth,
+            position * 32 + 16 + (mode & 1), cursor, 1);
+      }
+      if (!(options & 16))
+         return match(state, expression, scope, depth, mode, null, true)? position + 1 : -1;
+      if (id === 17 || id === 18) {
+         arity(state, expression, 1, 1);
+         return (id === 17? position === 0 : end)? position : -1;
+      }
+      // One-argument HAS/IS retain the sequence/regex context. Their alternate
+      // target forms are ordinary element predicates and consume one element.
+      if (id === 1 || id === 2) {
+         arity(state, expression, 2, 3);
+         if (expression.length === 2) {
+            options= position * 32 + 16 + (id === 2? 1 : 0);
+            return argument(state, expression, 1, scope, depth, sequenceTerm, options, cursor);
+         }
+      }
+      if (id === 3 || id === 4 || id === 5 || id >= 14 && id <= 16)
+         fail(state, "INVALID_GRAFT", "Sequence alternatives, repetition and captures are not implemented");
+      if (cursor.info && (id === null || id < 1 || id > 18 || mode & 4 && id !== 6 && id !== 8)) {
+         if (id !== null || mode & 4) {
+            expression= borrow(state, expression, scope, depth + 1);
+            kind= type(expression);
+         }
+         id= null;
+      }
+   }
+   if (cursor.info && (mode & 2 || id === null)) {
+      if (kind === "string") {
+         offset= stringOffset(state, cursor.info, position);
+         next= offset + expression.length;
+         charge(state, expression.length + 1);
+         if (stringSlice.call(cursor.info.text, offset, next) !== expression
+               || !stringBoundary(cursor.info.text, next, !!cursor.info.checkpoints))
+            return -1;
+         info= stringInfo(state, expression);
+         stringOffset(state, info, Infinity);
+         return position + info.length;
+      }
+      return !end && kind === "number" && expression === cursor.value[0]? position + 1 : -1;
+   }
+   return match(state, expression, scope, depth, mode, null, true)? position + 1 : -1;
+}
+
+// Compose consecutive terms from a cursor position, returning the successor
+// or -1. Structural arrays start at element zero; SEQ skips its opcode.
+function sequenceTerms(state, expression, scope, depth, options, cursor, start) {
+   var i, position= Math.floor(options / 32), mode= options & 31;
+   charge(state, expression.length);
+   for (i= start; i < expression.length; i++) {
+      position= argument(state, expression, i, scope, depth, sequenceTerm, position * 32 + mode, cursor);
+      if (position < 0)
+         return -1;
+   }
+   return position;
 }
 
 // mode bits: 1 = exact, 2 = already-evaluated literal, 4 = EXPR definition
@@ -898,6 +1027,33 @@ function matchValue(state, expression, scope, depth, mode, target) {
          ? operation(state, expression, expressions) : null;
       if (id === -5)
          return match(state, macro(state, expression, scope, depth), scope, depth + 1, mode | 4, target);
+      if (id === 8) {
+         arity(state, expression, 1, 2);
+         scope= target || scope;
+         value= read(state, scope.node, depth);
+         if (typeof value !== "string")
+            return false;
+         if (expression.length === 1)
+            return true;
+         local= sequenceCursor(state, scope, value);
+         i= 0;
+         do {
+            result= argument(state, expression, 1, scope, depth, sequenceTerm, i * 32 + 16 + (mode & 1), local);
+            if (result >= 0)
+               return true;
+         } while (!sequencePosition(state, local, i++));
+         return false;
+      }
+      if (id === 17 || id === 18) {
+         arity(state, expression, 1, 1);
+         scope= target || scope;
+         i= scope.node.keys.length - 1;
+         if (i < 0)
+            return false;
+         local= parentReference(state, scope.node);
+         value= read(state, local, depth);
+         return type(value) === "array" && scope.node.keys[i] === (id === 17? 0 : value.length);
+      }
       if (id !== null && id >= 1 && id <= 6) {
          scope= target || scope;
          if (id <= 2) {
@@ -938,12 +1094,13 @@ function matchValue(state, expression, scope, depth, mode, target) {
       charge(state, kind === "string"? (expression.length + value.length) * 0.001 : 1);
       return kind === "date"? dateTime.call(expression) === dateTime.call(value) : expression === value;
    }
-   // Arrays can test one nonexistent element at LENGTH, but never beyond it.
-   if (kind === "array" && (expression.length > value.length + 1
-         || mode & 1 && value.length > expression.length))
-      return false;
+   if (kind === "array") {
+      i= sequenceTerms(state, expression, scope, depth, mode & 3,
+         sequenceCursor(state, scope, value), 0);
+      return i >= 0 && (!(mode & 1) || i >= value.length);
+   }
    names= keys(state, expression);
-   if (mode & 1 && kind === "object") {
+   if (mode & 1) {
       local= keys(state, value);
       charge(state, local.length);
       for (i= 0; i < local.length; i++)
@@ -958,7 +1115,7 @@ function matchValue(state, expression, scope, depth, mode, target) {
    charge(state, names.length, 8);
    for (i= 0; i < names.length; i++) {
       key= names[i];
-      local.node.keys.push(kind === "array"? Number(key) : key);
+      local.node.keys.push(key);
       // Bit 4 accompanies only this EXPR root; literal children retain bit 2.
       result= argument(state, expression, key, local, depth, match, mode & 3);
       local.node.keys.pop();
@@ -988,7 +1145,7 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       state.element= referenceElement(state, reference, depth);
       return value;
    }
-   if (id >= 1 && id <= 6)
+   if (id >= 1 && id <= 6 || id === 8 || id === 17 || id === 18)
       return match(state, expression, scope, depth);
    if (id === 52) {
       arity(state, expression, 2, Infinity);

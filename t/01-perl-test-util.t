@@ -22,12 +22,15 @@ sub perl_string {
 # Exercise a real Perl -> engine -> TAP invocation. Fixtures have small bounded
 # output, so collecting stdout and stderr sequentially cannot fill either pipe.
 sub run_fixture {
-   my ($engine, $name, $source, $options, $timeout)= @_;
+   my ($engine, $name, $source, $options, $timeout, $subtests)= @_;
    my $file= File::Spec->catfile($dir, "$name.t");
    open my $fh, '>', $file or die "Cannot write $file: $!";
    print {$fh} '//; use lib ', perl_string($lib), '; use TestJGraft',
       ($options || ''), ";\n", $source;
    close $fh or die "Cannot close $file: $!";
+   local $ENV{TESTJS_SUBTESTS};
+   if (defined $subtests) { $ENV{TESTJS_SUBTESTS}= $subtests; }
+   else { delete $ENV{TESTJS_SUBTESTS}; }
    local $ENV{TESTJS}= $engine;
    local $ENV{TESTJS_TIMEOUT}= $timeout || 1000;
    my $err= gensym;
@@ -103,6 +106,53 @@ for my $engine (qw(phantomjs node)) {
       ($status, $output)= run_fixture($engine, 'async',
          "TAP(function(t) { setTimeout(function() { t.pass('async'); t.done_testing(); }, 10); });\n");
       is($status, 0, 'waits for asynchronous completion');
+
+      my $filtered= <<'JS';
+TAP(function(t) {
+   t.subtest('drop', function() {throw new Error('unselected callback ran');});
+   t.subtest('keep', function(t) {t.subtest('nested',function(t){t.pass('selected descendant');});});
+   t.done_testing();
+});
+JS
+      ($status, $output)= run_fixture($engine, 'subtest filter', $filtered, '', 1000, q{^keep(?: ['"])?$});
+      is($status, 0, 'passes the regex through to TAP without shell interpretation');
+      like($output, qr/1\.\.0 # SKIP Filtered out by subtest filter/, 'nonmatching groups explicitly skip');
+      like($output, qr/selected descendant/, 'matching group runs its descendants');
+      unlike($output, qr/unselected callback ran/, 'skipped callbacks never execute');
+      like($output, qr/^ok 2 - Subtest: keep$/m, 'filtering preserves original test numbers');
+      my $filtered_parser= TAP::Parser->new({tap => $output});
+      1 while $filtered_parser->next;
+      ok(!$filtered_parser->has_problems, 'filtered results remain valid TAP');
+
+      my $container= <<'JS';
+TAP(function(t) {
+   TestJGraft.runConformanceTests(t,{version:1,name:'fixture suite',tests:[
+      {name:'drop',input:0,jgraft:[],output:0},
+      {name:'wanted',input:1,jgraft:[],output:1}
+   ]},function(input) {if (!input) throw new Error('unselected fixture ran');return input;});
+   t.done_testing();
+});
+JS
+      ($status, $output)= run_fixture($engine, 'case filter', $container, '', 1000, '^fixture suite / wanted$');
+      is($status, 0, 'selects a conformance case through its suite container');
+      like($output, qr/ok 2 - Subtest: wanted/, 'case index is unchanged');
+      unlike($output, qr/unselected fixture ran/, 'unselected conformance graft is not applied');
+      like($output, qr/^# Conformance total: 2 cases; 1 passed, 0 failed, 1 skipped,/m,
+         'runner emits fixture totals as root TAP notes');
+      like($output, qr/^1\.\.1\n# Conformance /m, 'summary follows the completed root plan');
+      my $summary_parser= TAP::Parser->new({tap => $output});
+      1 while $summary_parser->next;
+      ok(!$summary_parser->has_problems, 'summary notes preserve valid TAP and passing status');
+
+      ($status, $output)= run_fixture($engine, 'invalid subtest filter', $filtered, '', 1000, '[');
+      isnt($status, 0, 'invalid regexes fail before running tests');
+      like($output, qr/Invalid subtest filter/, 'explains the malformed pattern');
+      unlike($output, qr/selected descendant/, 'invalid filters do not run callbacks');
+
+      ($status, $output)= run_fixture($engine, 'empty subtest filter',
+         "TAP(function(t){t.subtest('case',function(t){t.pass('unfiltered');});t.done_testing();});\n", '', 1000, '');
+      is($status, 0, 'empty environment value disables filtering');
+      like($output, qr/unfiltered/, 'empty filter executes the group');
 
       ($status, $output)= run_fixture($engine, 'missing',
          "TAP(function(t) { t.done_testing(); });\n", " -load => 'missing.js'");

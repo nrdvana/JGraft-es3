@@ -18,7 +18,8 @@ my @engines= qw(phantomjs node);
 # -load accepts a filename or array of filenames, relative to the test file.
 # TESTJS selects phantomjs, node, or all. By default, use the first installed
 # engine in that order. TESTJS_TIMEOUT is a per-engine wall-clock limit in ms,
-# including startup and synchronous code.
+# including startup and synchronous code. TESTJS_SUBTESTS selects named
+# subtest callbacks with a JavaScript regex; unmatched groups retain SKIP plans.
 sub import {
    my ($class, @options)= @_;
    my (undef, $file)= caller;
@@ -143,8 +144,10 @@ sub run_test {
       or die "Unknown TESTJS engine '$mode' (expected @engines or all)\n";
    my $timeout= defined $ENV{TESTJS_TIMEOUT}? $ENV{TESTJS_TIMEOUT} : 10000;
    $timeout =~ /\A[1-9][0-9]*\z/ or die "TESTJS_TIMEOUT must be a positive integer\n";
+   my @filters= defined $ENV{TESTJS_SUBTESTS} && length $ENV{TESTJS_SUBTESTS}
+      ? ("--subtests=$ENV{TESTJS_SUBTESTS}") : ();
    my @runs= map {
-      start_engine($_, $timeout, "$lib/run-$_.js", "--timeout=$timeout",
+      start_engine($_, $timeout, "$lib/run-$_.js", "--timeout=$timeout", @filters,
          "$lib/tap.js", "$lib/TestJGraft.js", @load, $file);
    } $mode eq 'all'? @engines : ($mode);
    collect_engines($timeout, @runs);

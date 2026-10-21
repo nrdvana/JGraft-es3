@@ -16,7 +16,7 @@ var runner= TestJGraft.createRunner(require("system").args.slice(1), function(st
       } : null;
    });
 });
-var currentScript, i;
+var currentScript, i, configured= false;
 
 page.onConsoleMessage= function(message) {
    console.log(message);
@@ -68,6 +68,13 @@ try {
       currentScript= fs.absolute(runner.scripts[i]);
       if (!page.injectJs(currentScript))
          runner.fail("Cannot load script: " + runner.scripts[i]);
+      if (!configured && runner.subtests !== undefined) {
+         configured= page.evaluate(function(pattern) {
+            if (typeof TAP === "undefined") return false;
+            TAP.root.filterSubtests(pattern);
+            return true;
+         }, runner.subtests);
+      }
    }
 } catch (error) {
    runner.fail(error.stack || error);

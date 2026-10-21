@@ -207,5 +207,126 @@ TAP(function(t) {
          JGraft= saved;
       }
    });
+   t.subtest('descriptor-backed prototype properties', function(t) {
+      function object(value) {
+         var result= {};
+         Object.defineProperty(result, '__proto__', {value:value, enumerable:true, configurable:true});
+         return result;
+      }
+      t.ok(!check(fixture(null, object(1)), function(){return object(2);}).success,
+         'comparison detects different own __proto__ data even on old V8');
+      failsMutation(t, 'snapshot detects edits inside an own __proto__ subtree', object({keep:1}), function(input) {
+         Object.getOwnPropertyDescriptor(input, '__proto__').value.keep= 2;
+      });
+   });
+
+   t.subtest('JGraft error state diagnostics', function(t) {
+      function notes(code) {
+         var test= new TAP(), emit= TAP.prototype.emit, lines= [];
+         TAP.prototype.emit= function(line) {lines.push(this.prefix+line);};
+         try { code(test); } finally { TAP.prototype.emit= emit; }
+         t.ok(test.success && !test.results.length, 'error reporting is diagnostic only');
+         return lines.join('\n');
+      }
+      var error, graft= ['JGRAFT',{v:1},['COPY',2,'edited',['NODE','absent'],'bad']];
+      var input= {keep:1};
+      try {new JGraft(graft).apply(input);} catch (caught) {error=caught;}
+      var text= notes(function(test) {TestJGraft.noteError(test,error,{input:input,jgraft:graft,output:7});});
+      t.ok(/JGraftError INVALID_TARGET/.test(text), 'starts with the error class and code');
+      t.ok(/graftPath: \[2, 3\]/.test(text) && /inputPath: \["absent"\]/.test(text), 'prints both recorded paths');
+      t.ok(/counts:/.test(text) && /limits:/.test(text), 'includes counters and effective limits');
+      t.ok(/Graft at recorded path: \["NODE", "absent"\]/.test(text), 'locates the failing graft subtree');
+      t.ok(/Original input at recorded path missing; nearest path: \[\]/.test(text), 'a missing input path is explicit');
+      t.ok(/Partial output: \{"edited": 2, "keep": 1\}/.test(text), 'preceding edits remain visible');
+      t.ok(/Expected output: 7/.test(text), 'optional context includes the expected result');
+      text= notes(function(test) {TestJGraft.noteError(test,{code:'CUSTOM',message:'first\nsecond',graftPath:[2,9]}, {jgraft:graft});});
+      t.ok(/Graft at recorded path missing; nearest path: \[2\]/.test(text), 'an expanded or missing graft path reports the nearest original node');
+      t.ok(!/^second$/m.test(text), 'multiline messages cannot inject raw TAP lines');
+      text= notes(function(test) {TestJGraft.noteError(test,'NO_MATCH');TestJGraft.noteError(test,null);});
+      t.ok(/Thrown: "NO_MATCH"/.test(text) && /Thrown: null/.test(text), 'non-object exceptions are supported');
+      try {new JGraft(['JGRAFT',{v:1}],{limits:{ops:0}}).apply(null);} catch (caughtLimit) {error=caughtLimit;}
+      text= notes(function(test) {TestJGraft.noteError(test,error);});
+      t.ok(/resource: "ops"/.test(text) && /"ops": 0/.test(text), 'resource errors show the exhausted counter and its budget');
+      var calls= 0, accessorInput= {};
+      Object.defineProperty(accessorInput,'x',{get:function(){calls++;throw new Error('must not run');},enumerable:true});
+      text= notes(function(test) {TestJGraft.noteError(test,{code:'CUSTOM',inputPath:['x']},{input:accessorInput});});
+      t.ok(/accessor at path/.test(text) && calls === 0,'path diagnostics do not re-execute a failing input getter');
+   });
+
+   t.subtest('conformance diagnostics use shared helpers', function(t) {
+      var differences= 0, errors= 0, originalDiff= TAP.prototype.noteDifferences, originalError= TestJGraft.noteError;
+      try {
+         TAP.prototype.noteDifferences= function(a,b) {differences++;t.is(a,{x:1},'difference old value is expected');t.is(b,{x:2},'difference new value is actual');};
+         TestJGraft.noteError= function(test,error,context) {errors++;t.is(error.code,'CUSTOM','forwards the error');t.ok(context.jgraft && context.input === 1,'forwards fixture context');};
+         check(fixture(null,{x:1}),function(){return {x:2};});
+         check(fixture(1,2),function(){throw {code:'CUSTOM'};});
+      } finally {
+         TAP.prototype.noteDifferences= originalDiff;
+         TestJGraft.noteError= originalError;
+      }
+      t.is(differences,1,'output mismatch uses noteDifferences');
+      t.is(errors,1,'unexpected errors use noteError');
+   });
+
+   t.subtest('conformance totals at root completion', function(t) {
+      var emit= TAP.prototype.emit, lines= [], root= new TAP(), calls= 0;
+      var suite= {version:1, name:'Counted suite', tests:[fixture(null,1),fixture(null,2)]};
+      suite.tests[0].name= 'pass';
+      suite.tests[1].name= 'fail';
+      TAP.prototype.emit= function(line) {lines.push(this.prefix + line);};
+      try {
+         TestJGraft.runConformanceTests(root,suite,function(){calls++;return 1;});
+         root.todo('pending',function(t) {
+            t.subtest('TODO parent',function(t) {
+               TestJGraft.runConformanceTests(t,suite,function(){return 1;});
+            });
+         });
+         t.ok(!/Conformance total:/.test(lines.join('\n')),'does not summarize before root completion');
+         var results= root.results.length, success= root.success;
+         root.done_testing();
+         t.is(root.results.length,results,'notes add no assertions');
+         t.is(root.success,success,'notes preserve failure status');
+         t.ok(/Conformance total: 4 cases; 1 passed, 1 failed, 0 skipped, 1 TODO failed, 1 TODO passed \(unexpected\), 0 not run/.test(lines.join('\n')),
+            'counts fixtures once and distinguishes TODO outcomes inherited from ancestors');
+         root.done_testing();
+         t.is(lines.join('\n').split('Conformance total:').length-1,1,'repeated completion does not duplicate totals');
+         lines= [];
+         root= new TAP();
+         root.filterSubtests('^pass$');
+         TestJGraft.runConformanceTests(root,suite,function(){calls++;return 1;});
+         root.done_testing();
+         t.ok(/Conformance total: 2 cases; 1 passed, 0 failed, 1 skipped/.test(lines.join('\n')),'filtered cases count as skips');
+         t.is(calls,3,'filtered fixture never executes');
+         lines= [];
+         root= new TAP();
+         var saved= JGraft;
+         try {
+            JGraft= function(){this.forbidProto=true;};
+            JGraft.prototype.apply= function(){return 1;};
+            var restricted= fixture(null,1);
+            restricted.needProto= true;
+            TestJGraft.runConformanceTests(root,{version:1,name:'Restricted',tests:[restricted]});
+            delete JGraft.prototype.apply;
+            TestJGraft.runConformanceTests(root,suite);
+            // A constructor error aborts a loaded suite before its cases run.
+            JGraft.prototype.apply= function(){};
+            JGraft= function(){throw new Error('construction failed');};
+            JGraft.prototype.apply= function(){};
+            TestJGraft.runConformanceTests(root,suite);
+            root.done_testing();
+         } finally { JGraft= saved; }
+         t.ok(/Conformance total: 5 cases; 0 passed, 0 failed, 3 skipped, 0 TODO failed, 0 TODO passed \(unexpected\), 2 not run/.test(lines.join('\n')),
+            'distinguishes host and missing-implementation skips from an aborted suite');
+         t.ok(!root.success,'an aborted suite still fails the run');
+         lines= [];
+         root= new TAP();
+         root.pass('ordinary assertion');
+         root.done_testing();
+         t.ok(!/Conformance total:/.test(lines.join('\n')),'ordinary unit tests have no fixture totals');
+      } finally {
+         TAP.prototype.emit= emit;
+      }
+   });
+
    t.done_testing();
 });

@@ -12,7 +12,7 @@ var runner= TestJGraft.createRunner(process.argv.slice(2), function(status) {
 }, function() {
    return typeof TAP !== "undefined" && TAP.root;
 });
-var i;
+var i, configured= false;
 
 process.on("uncaughtException", function(error) {
    runner.fail(error.stack || error);
@@ -47,9 +47,14 @@ function runScript(filename) {
 }
 
 try {
-   for (i= 0; i < runner.scripts.length; i++)
+   for (i= 0; i < runner.scripts.length; i++) {
       if (!runScript(runner.scripts[i]))
          return;
+      if (!configured && runner.subtests !== undefined && typeof TAP !== "undefined") {
+         TAP.root.filterSubtests(runner.subtests);
+         configured= true;
+      }
+   }
 } catch (error) {
    runner.fail(error.stack || error);
 }
