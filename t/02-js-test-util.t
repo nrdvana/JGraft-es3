@@ -166,5 +166,46 @@ TAP(function(t) {
          JGraft= saved;
       }
    });
+
+   t.subtest('conditional host-restriction skips', function(t) {
+      var saved= JGraft, test= fixture({}, {}), result, called= false, forbidden= true;
+      try {
+         JGraft= function(graft, config) {
+            return new saved(graft, {limits: config && config.limits, forbidProto: forbidden});
+         };
+         JGraft.prototype= saved.prototype;
+         test.name= 'A property test';
+         test.needProto= true;
+         result= check(test);
+         t.ok(result.success && result.results[0].skipped, 'the default adapter skips an explicit requirement when restricted');
+         result= check(test, function(input) { called= true; return input; });
+         t.ok(called && result.success && !result.results[0].skipped, 'custom executors run flagged rejection tests normally');
+         forbidden= false;
+         result= check(test);
+         t.ok(result.success && !result.results[0].skipped, 'flagged cases still run when the restriction is disabled');
+         forbidden= true;
+         delete test.needProto;
+         test.name= 'Property names except __proto__';
+         test.desc= 'No __proto__ support needed';
+         result= check(test);
+         t.ok(result.success && !result.results[0].skipped, 'names and descriptions do not imply a requirement');
+         test.needProto= false;
+         result= check(test);
+         t.ok(result.success && !result.results[0].skipped, 'an explicit false requirement does not skip');
+         test.needProto= 'true';
+         result= check(test);
+         t.ok(result.success && !result.results[0].skipped, 'only boolean true enables a skip');
+         delete test.needProto;
+         test.jgraft.push(['COPY', 1, '__proto__']);
+         result= check(test);
+         t.ok(!result.success && !result.results[0].skipped, 'an unflagged unsupported operation remains a failure');
+         test.needProto= true;
+         delete test.input;
+         result= check(test);
+         t.ok(!result.success && !result.results[0].skipped, 'skip flags do not hide malformed fixture records');
+      } finally {
+         JGraft= saved;
+      }
+   });
    t.done_testing();
 });

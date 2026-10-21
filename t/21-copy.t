@@ -2,7 +2,7 @@
 
 TAP(function(t) {
    function run(input, action, options) {
-      return new JGraft(['JGRAFT', {v: 1}, action]).apply(input, options);
+      return new JGraft(['JGRAFT', {v: 1}, action], {forbidProto: false}).apply(input, options);
    }
    function errorOf(graft, input, options) {
       try {
@@ -79,7 +79,8 @@ TAP(function(t) {
       output= run(input, ['COPY', 3, ['NODE', 'inherited', 'x']]);
       t.is(output.inherited.x, 3, 'write auto-vivifies an own container');
       t.is(Input.prototype.inherited.x, 1, 'write does not alter the external prototype');
-      error= errorOf(new JGraft(['JGRAFT', {v: 1}, ['COPY', ['NODE', '__proto__'], 'copy']]), {});
+      error= errorOf(new JGraft(['JGRAFT', {v: 1}, ['COPY', ['NODE', '__proto__'], 'copy']],
+         {forbidProto: false}), {});
       t.is(error.code, 'INVALID_TARGET', 'magic __proto__ accessor is not input data');
       output= run({}, ['COPY', {safe: 1}, '__proto__', 2, ['NODE', '__proto__', 'x'],
          ['NODE', '__proto__'], 'copy']);

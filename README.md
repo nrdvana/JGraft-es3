@@ -51,6 +51,12 @@ diagnostic trees are not defensively cloned. Paths inside temporary or constant
 namespaces describe the location in that namespace. Invalid resource
 configuration throws a `TypeError` during construction.
 
+`UNSUPPORTED_GRAFT` reports a valid positive integer version newer than this
+implementation supports, or a property operation forbidden by the host
+configuration. It always terminates the graft, including inside MATCH, IF,
+and logical matching expressions. Malformed version declarations remain
+`INVALID_GRAFT`.
+
 During MOVE, array deletions and half-index insertions are deferred until the
 action finishes. If it fails before final rebuilding, pending deletions appear
 as `null` at their original positions in `partial`, and queued half-index
@@ -58,24 +64,40 @@ insertions are omitted.
 SPLICE evaluates every replacement before changing its target. A resource
 failure while committing an edit can still leave a partially edited result.
 
-Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT,
-NODE/TEMP/STASH/CONST/CAP references, EXPR expansion, LOCAL, NOT, LENGTH,
+Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
+HAS, IS, NONE, ANY, ALL, EXISTS, NODE/TEMP/STASH/CONST/CAP references,
+EXPR expansion, LOCAL, NOT, LENGTH,
 SLICE, CONCAT, and FAIL. There is supporting SPLIT action/expression and JOIN
 expression behavior for literal separators/trimming and ANY lists of literal
 alternatives, including separator/trim metadata carried by array edits.
 The full SPLIT regex language and its `keep`/`element` options are pending;
-matching actions and the remaining expressions are also pending.
+sequence matching, captures, and the remaining expressions are also pending.
 LENGTH counts JavaScript UTF-16 code units. Native Dates can be copied; the specification's other date
 operations and virtual date properties are pending.
 
 ## Engine and JSON requirements
 
-Use a conforming JSON parser for arbitrary property names. In particular,
-Node 0.10's native parser interprets `"__proto__"` as the object's actual
-prototype, losing an ordinary data property before JGraft receives it. Use a
-replacement parser on affected engines. JGraft ignores inherited data and
-never calls methods obtained from input objects; it does not reconstruct data
-lost by a broken parser.
+`config.forbidProto` is a boolean option that forbids accessing, enumerating,
+or producing an own property named `__proto__`, including in paths, match
+patterns, constructed values, and namespace declarations. Rejection uses
+`UNSUPPORTED_GRAFT`. The spelling is still allowed as ordinary string data.
+The instance's `forbidProto` property reports its effective setting.
+
+By default, each constructor probes the currently installed JSON parser and
+enables this restriction if it drops `__proto__` data or changes prototypes.
+For example, Node 0.10's parser discards scalar values and installs object
+values as actual prototypes. Set `{forbidProto: true}` to apply the restriction
+on any engine. Set `{forbidProto: false}` to allow the name explicitly, for
+example when supplying descriptor-built data or using a conforming replacement
+parser. A parser installed before construction affects the detected default.
+
+The restriction is checked during visited property operations; it does not
+scan untouched input subtrees. A copy-on-write parent clone or final output
+cloning can encounter and reject a forbidden own property. It cannot identify
+properties already discarded from input or graft JSON by a broken parser.
+Use a conforming parser when arbitrary property names must be preserved.
+JGraft ignores inherited data and never calls methods obtained from input
+objects; it does not reconstruct data lost by a broken parser.
 
 Engines with a magic `__proto__` setter need working
 `Object.defineProperty` and `Object.getOwnPropertyDescriptor` implementations
@@ -89,10 +111,12 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 444 COPY/MOVE/SPLICE conformance cases and
-the local implementation tests are active without TODO markers. Node 0.10's
-native JSON parser causes four known conformance failures involving
-`__proto__`; the descriptor-built local ownership and property tests pass.
+`all` runs both in parallel. All 792 COPY/MOVE/SPLICE/MATCH conformance cases,
+the IF subtest, and local implementation tests are active without TODO markers.
+The default adapter explicitly skips the eight cases with `needProto: true`
+when `forbidProto` is enabled. Names and descriptions do not affect skipping.
+Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
+restriction; host-restriction tests separately verify rejection on every engine.
 
 The optional Mojolicious app `t/serve-tests daemon -l http://*:3000` serves the
 Git-tracked repository files and browser test pages. Mojolicious is not needed

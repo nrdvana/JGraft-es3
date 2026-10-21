@@ -149,12 +149,18 @@ function describe(value) {
    }
 }
 
-function runCase(t, test, apply) {
+function runCase(t, test, apply, forbidProto) {
    t.subtest(test.name, function(t) {
       var before, output, error, caught= false, code, allowed= test.errors || {};
       var mustLimit= owns(allowed, "RESOURCE_LIMIT") && allowed.RESOURCE_LIMIT === true;
       if (!owns(test, "input") || !owns(test, "jgraft") || (!owns(test, "output") && !owns(test, "errors"))) {
          t.fail("Case requires input, jgraft, and output or errors");
+         return;
+      }
+      // The explicit requirement survives a parser which has lost the key.
+      // Custom executors run every case; this restriction belongs to our adapter.
+      if (forbidProto && owns(test, "needProto") && test.needProto === true) {
+         t.plan(0, "Host configuration forbids __proto__ properties");
          return;
       }
       before= snapshot(test.input);
@@ -189,7 +195,7 @@ function applyGraft(input, graft, limits) {
 }
 
 function runConformanceTests(t, source, apply) {
-   var suite, i;
+   var suite, i, forbidProto;
    try {
       suite= typeof source === "string"? JSON.parse(TestJGraft.readFile(source)) : source;
       if (!suite || suite.version !== 1 || typeof suite.name !== "string"
@@ -207,8 +213,9 @@ function runConformanceTests(t, source, apply) {
          t.plan(0, "JGraft.prototype.apply is not implemented");
          return;
       }
+      forbidProto= !apply && new global.JGraft(["JGRAFT", {v: 1}]).forbidProto;
       for (i= 0; i < suite.tests.length; i++)
-         runCase(t, suite.tests[i], apply || applyGraft);
+         runCase(t, suite.tests[i], apply || applyGraft, forbidProto);
    });
 }
 

@@ -10,8 +10,9 @@ var getDescriptor= Object.getOwnPropertyDescriptor;
 var dateTime= Date.prototype.getTime;
 var stringSlice= String.prototype.slice;
 var defaults= {mem: 67108864, ops: 1000000, new_obj: 100000, depth: 128};
-var actions= {JGRAFT: -1, AT: 0, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6};
+var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6};
 var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
+   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6,
    LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, FAIL: 67};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
 // Checking an inherited sentinel also works when descriptors are unavailable.
@@ -61,6 +62,20 @@ function integer(value) {
    return typeof value === "number" && isFinite(value) && Math.floor(value) === value;
 }
 
+// Probe at construction so installing a replacement parser changes the default
+// for later instances. Test both silently discarded scalars and prototype writes.
+function brokenJSON() {
+   var value;
+   try {
+      value= JSON.parse('{"__proto__":0,"child":{"__proto__":{"probe":1}}}');
+      return !owns(value, "__proto__") || get(value, "__proto__") !== 0
+         || !owns(get(value, "child"), "__proto__")
+         || get(get(get(value, "child"), "__proto__"), "probe") !== 1;
+   } catch (error) {
+      return true;
+   }
+}
+
 // new JGraft(graft[, config]) takes ownership of graft and its descendants.
 // Retained references must not be modified; future versions may cache analysis.
 // config.limits overrides the defaults above; Infinity disables a limit.
@@ -68,6 +83,10 @@ function JGraft(graft, config) {
    var supplied= get(config, "limits"), key, value;
    this._graft= graft;
    this._limits= {};
+   value= owns(config, "forbidProto")? get(config, "forbidProto") : brokenJSON();
+   if (typeof value !== "boolean")
+      throw new TypeError("Invalid JGraft forbidProto option");
+   this.forbidProto= value;
    // Copy scalar limits so later changes to config cannot change this budget.
    for (key in defaults) {
       value= owns(supplied, key)? get(supplied, key) : defaults[key];
@@ -116,12 +135,20 @@ function make(state, array) {
    return array? [] : {};
 }
 
+// Called at charged property accesses/enumerations, including absent paths.
+// This is a host/configuration restriction, never a malformed-graft diagnosis.
+function property(state, key) {
+   if (state.forbidProto && key === "__proto__")
+      fail(state, "UNSUPPORTED_GRAFT", "Host configuration forbids __proto__ properties");
+}
+
 // Account for enumeration, including inherited keys which must be ignored.
 function keys(state, value) {
    var result= make(state, true), key;
    for (key in value) {
       charge(state, 1);
       if (owns(value, key)) {
+         property(state, key);
          charge(state, 0, 8 + key.length * 2);
          result.push(key);
       }
@@ -131,11 +158,12 @@ function keys(state, value) {
 
 // Assign arbitrary own keys without invoking the legacy prototype setter.
 function put(state, object, key, value) {
+   property(state, key);
    charge(state, 1 + String(key).length * 0.001,
       owns(object, key)? 0 : 16 + String(key).length * 2);
    if (key === "__proto__" && !ordinaryProto) {
       if (!defineProperty || !getDescriptor)
-         fail(state, "INVALID_TARGET", "This engine cannot safely store __proto__ properties");
+         fail(state, "UNSUPPORTED_GRAFT", "This engine cannot safely store __proto__ properties");
       charge(state, 1, 48, 1);
       // JavaScriptCore 1.9 can ignore value changes when redefining this key.
       // Our writable containers have configurable properties, so recreate it.
@@ -158,7 +186,7 @@ function holder(state, value, cloned) {
 }
 
 function createState(instance, input) {
-   var state= {input: input, limits: instance._limits,
+   var state= {input: input, limits: instance._limits, forbidProto: instance.forbidProto,
       counts: {mem: 0, ops: 0, new_obj: 0, depth: 0},
       graftPath: [], inputPath: []};
    // Publish before any limit check so failed attempts also expose counts.
@@ -219,11 +247,12 @@ function copy(state, value, depth, shallow, scope) {
 
 // Visit a child while retaining its location in the graft for diagnostics.
 // Optional handlers select action/path/construction contexts without wrappers.
-function argument(state, source, key, scope, depth, handler, parameter) {
+// Matching can also supply the scope to use after operand evaluation.
+function argument(state, source, key, scope, depth, handler, parameter, target) {
    var result;
    charge(state, 1, 8);
    state.graftPath.push(key);
-   result= (handler || evaluate)(state, get(source, key), scope, depth + 1, parameter);
+   result= (handler || evaluate)(state, get(source, key), scope, depth + 1, parameter, target);
    state.graftPath.pop();
    return result;
 }
@@ -249,6 +278,7 @@ function macro(state, expression, scope, depth) {
    name= argument(state, expression, 1, scope, depth);
    if (typeof name !== "string" && !integer(name))
       fail(state, "INVALID_OPERAND", "Invalid common expression name");
+   property(state, String(name));
    if (!owns(scope.expr, String(name)))
       fail(state, "INVALID_TARGET", "Missing common expression");
    return get(scope.expr, String(name));
@@ -301,6 +331,7 @@ function path(state, expression, scope, depth, writing) {
       charge(state, expanded.length, expanded.length * 8);
       for (j= 0; j < expanded.length; j++) {
          item= get(expanded, j);
+         property(state, item);
          if (typeof item !== "string" && item !== false && !integer(item)
                && !(writing === 3 && typeof item === "number" && integer(item * 2)))
             fail(state, code, "Invalid path selector");
@@ -319,6 +350,7 @@ function path(state, expression, scope, depth, writing) {
 function selector(state, parent, key, writing) {
    var kind= type(parent);
    charge(state, 1);
+   property(state, key);
    if (kind === "array" && writing === 2 && typeof key === "number"
          && integer(key * 2) && !integer(key)) {
       key= key < -0.5? parent.length + key : key;
@@ -822,6 +854,117 @@ function borrow(state, expression, scope, depth) {
    return evaluate(state, expression, scope, depth, true);
 }
 
+// A temporary current node borrows its value. Expressions cannot mutate it,
+// and writes to data subsequently returned by an expression still copy it.
+function valueScope(state, scope, value) {
+   var result= scopeCopy(state, scope);
+   result.node= make(state);
+   result.node.tree= holder(state, value, false);
+   result.node.keys= make(state, true);
+   return result;
+}
+
+// Probe errors mean false; syntax/resource errors and application exceptions
+// escape. Discard diagnostic path segments left by a failed argument walk so
+// another alternative or a later action gets its own correct location.
+function match(state, expression, scope, depth, mode, target) {
+   var pathLength= state.graftPath.length, inputPath= state.inputPath;
+   try {
+      return matchValue(state, expression, scope, depth, mode || 0, target);
+   } catch (error) {
+      if (!error || error.counts !== state.counts
+            || error.code !== "INVALID_TARGET" && error.code !== "INVALID_OPERAND")
+         throw error;
+      state.graftPath.length= pathLength;
+      state.inputPath= inputPath;
+      state.element= null;
+      return false;
+   }
+}
+
+// mode bits: 1 = exact, 2 = already-evaluated literal, 4 = EXPR definition
+// with value-construction semantics unless rooted in a match expression.
+// Bit 8 unwraps one escaped array while retaining syntax in its children.
+// target delays rebinding NODE until after a direct function/reference (or
+// constructing definition) has been evaluated in the original scope.
+function matchValue(state, expression, scope, depth, mode, target) {
+   var kind= type(expression), id, value, local, names, key, i, result;
+   charge(state, 1, 0, 0, depth);
+   if (!(mode & 10)) {
+      id= kind === "array" && !(expression.length === 1 && type(get(expression, 0)) === "array")
+         ? operation(state, expression, expressions) : null;
+      if (id === -5)
+         return match(state, macro(state, expression, scope, depth), scope, depth + 1, mode | 4, target);
+      if (id !== null && id >= 1 && id <= 6) {
+         scope= target || scope;
+         if (id <= 2) {
+            arity(state, expression, 2, 3);
+            local= expression.length === 3? valueScope(state, scope,
+               argument(state, expression, 1, scope, depth, borrow)) : scope;
+            return argument(state, expression, expression.length - 1, scope, depth, match,
+               id === 2? 1 : 0, local);
+         }
+         if (id === 6) {
+            arity(state, expression, 1, 1);
+            read(state, scope.node, depth);
+            return true;
+         }
+         arity(state, expression, id === 3? 1 : 2, Infinity);
+         charge(state, expression.length);
+         for (i= 1; i < expression.length; i++) {
+            result= argument(state, expression, i, scope, depth, match, mode & 1);
+            if (result !== (id === 5))
+               return id === 4;
+         }
+         return id !== 4;
+      }
+      if (id !== null || mode & 4) {
+         expression= borrow(state, expression, scope, depth + 1);
+         kind= type(expression);
+         mode= mode & 1 | 2;
+      } else if (kind === "array") {
+         // An escaped array adds a structural level to diagnostics/depth.
+         return argument(state, expression, 0, target || scope, depth, match, mode | 8);
+      }
+   }
+   scope= target || scope;
+   value= read(state, scope.node, depth);
+   if (kind !== type(value))
+      return false;
+   if (kind !== "array" && kind !== "object") {
+      charge(state, kind === "string"? (expression.length + value.length) * 0.001 : 1);
+      return kind === "date"? dateTime.call(expression) === dateTime.call(value) : expression === value;
+   }
+   // Arrays can test one nonexistent element at LENGTH, but never beyond it.
+   if (kind === "array" && (expression.length > value.length + 1
+         || mode & 1 && value.length > expression.length))
+      return false;
+   names= keys(state, expression);
+   if (mode & 1 && kind === "object") {
+      local= keys(state, value);
+      charge(state, local.length);
+      for (i= 0; i < local.length; i++)
+         if (!owns(expression, local[i]))
+            return false;
+   }
+   local= scopeCopy(state, scope);
+   local.node= make(state);
+   local.node.tree= scope.node.tree;
+   charge(state, scope.node.keys.length, 32 + scope.node.keys.length * 8, 1);
+   local.node.keys= scope.node.keys.slice(0);
+   charge(state, names.length, 8);
+   for (i= 0; i < names.length; i++) {
+      key= names[i];
+      local.node.keys.push(kind === "array"? Number(key) : key);
+      // Bit 4 accompanies only this EXPR root; literal children retain bit 2.
+      result= argument(state, expression, key, local, depth, match, mode & 3);
+      local.node.keys.pop();
+      if (!result)
+         return false;
+   }
+   return true;
+}
+
 function evaluateValue(state, expression, scope, depth, borrowed) {
    var kind= type(expression), id, value, local, name, i, reference;
    location(state, scope);
@@ -842,6 +985,8 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       state.element= referenceElement(state, reference, depth);
       return value;
    }
+   if (id >= 1 && id <= 6)
+      return match(state, expression, scope, depth);
    if (id === 52) {
       arity(state, expression, 2, Infinity);
       charge(state, expression.length);
@@ -885,11 +1030,8 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       for (i= 1; i < expression.length - 1; i+= 2) {
          name= argument(state, expression, i, local, depth);
          value= argument(state, expression, i + 1, local, depth);
-         if (name === null) {
-            local.node= make(state);
-            local.node.tree= holder(state, value, true);
-            local.node.keys= make(state, true);
-         }
+         if (name === null)
+            local= valueScope(state, local, value);
          else if (typeof name === "string" || typeof name === "number")
             put(state, local.temp.value, String(name), value);
          else
@@ -1205,8 +1347,10 @@ function action(state, expression, inherited, depth) {
       arity(state, expression, 2, Infinity);
       metadata= get(expression, 1);
       if (type(metadata) !== "object" || owns(metadata, "v")
-            && (!integer(get(metadata, "v")) || get(metadata, "v") < 1 || get(metadata, "v") > 1))
-         fail(state, "INVALID_GRAFT", "Unsupported JGraft metadata or version");
+            && (!integer(get(metadata, "v")) || get(metadata, "v") < 1))
+         fail(state, "INVALID_GRAFT", "Invalid JGraft metadata or version");
+      if (get(metadata, "v") > 1)
+         fail(state, "UNSUPPORTED_GRAFT", "Unsupported JGraft version");
       scope.constants= holder(state, copy(state, scope.constants.value, depth, true), true);
       scope.expr= copy(state, scope.expr, depth, true);
       declarations(state, metadata, "const", scope, depth);
@@ -1222,6 +1366,27 @@ function action(state, expression, inherited, depth) {
       read(state, reference, depth);
       scope.node= reference;
       i= 2;
+   } else if (id === 1) {
+      arity(state, expression, 2, Infinity);
+      if (!argument(state, expression, 1, scope, depth, match)) {
+         state.graftPath.push(1);
+         location(state, scope);
+         fail(state, "NO_MATCH", "Current node does not match");
+      }
+      scope.cap= holder(state, make(state), true);
+      i= 2;
+   } else if (id === 2) {
+      charge(state, expression.length);
+      for (i= 1; i + 1 < expression.length; i+= 2)
+         if (argument(state, expression, i, scope, depth, match)) {
+            scope.cap= holder(state, make(state), true);
+            i++;
+            break;
+         }
+      // A final singleton is the else action and retains inherited captures.
+      if (i < expression.length)
+         argument(state, expression, i, scope, depth, action);
+      return;
    } else if (id === 3) {
       if (expression.length % 2 !== 1)
          fail(state, "INVALID_GRAFT", "COPY requires value/path pairs");

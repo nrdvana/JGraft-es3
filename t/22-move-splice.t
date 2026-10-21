@@ -2,7 +2,7 @@
 
 TAP(function(t) {
    function graft(actions, limits) {
-      return new JGraft(['JGRAFT', {v: 1}].concat(actions), {limits: limits});
+      return new JGraft(['JGRAFT', {v: 1}].concat(actions), {limits: limits, forbidProto: false});
    }
    function errorOf(instance, input, options) {
       try {
