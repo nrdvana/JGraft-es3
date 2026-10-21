@@ -9,6 +9,9 @@ var defineProperty= Object.defineProperty;
 var getDescriptor= Object.getOwnPropertyDescriptor;
 var dateTime= Date.prototype.getTime;
 var stringSlice= String.prototype.slice;
+var stringCode= String.prototype.charCodeAt;
+var regexpTest= RegExp.prototype.test;
+var surrogatePair= /[\uD800-\uDBFF][\uDC00-\uDFFF]/;
 var defaults= {mem: 67108864, ops: 1000000, new_obj: 100000, depth: 128};
 var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6};
 var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
@@ -1042,16 +1045,109 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
    fail(state, "INVALID_GRAFT", "Unsupported value expression");
 }
 
+// Decode at a UTF-16 boundary. step returns the width instead of the numeric
+// codepoint; lone surrogates always remain individual codepoints. Callers
+// charge the bounded reads, and retain their cursor as index/offset numbers.
+function character(info, offset, step) {
+   var first, second;
+   if (step && !info.checkpoints)
+      return 1;
+   first= stringCode.call(info.text, offset);
+   if (info.checkpoints && first >= 0xD800 && first <= 0xDBFF) {
+      second= stringCode.call(info.text, offset + 1);
+      if (second >= 0xDC00 && second <= 0xDFFF)
+         return step? 2 : 0x10000 + (first - 0xD800) * 1024 + second - 0xDC00;
+   }
+   return step? 1 : first;
+}
+
+// Keep immutable strings and small indexes per application. The fixed two-unit
+// regex has no unbounded backtracking; charge its full linear scan beforehand.
+// Strings without pairs need neither checkpoints nor per-character decoding.
+function stringInfo(state, text) {
+   var list= state.strings || (state.strings= make(state, true)), info, i;
+   charge(state, list.length);
+   for (i= 0; i < list.length; i++) {
+      charge(state, (list[i].text.length + text.length) * 0.001);
+      if (list[i].text === text)
+         return list[i];
+   }
+   charge(state, text.length, 80);
+   info= make(state);
+   info.text= text;
+   info.checkpoints= regexpTest.call(surrogatePair, text)? make(state, true) : null;
+   info.length= info.checkpoints? null : text.length;
+   info.index= info.offset= 0;
+   if (info.checkpoints) {
+      charge(state, 1, 8);
+      info.checkpoints.push(0);
+   }
+   charge(state, 1, 8);
+   list.push(info);
+   return info;
+}
+
+// Map a nonnegative codepoint index to UTF-16, or seek Infinity to count the
+// whole string. Reuse a forward cursor or begin at the nearest checkpoint.
+// Checkpoints are built lazily every 256 codepoints; no character array is made.
+// A seek beyond the end stops there and records the actual codepoint length.
+function stringOffset(state, info, index) {
+   var points= info.checkpoints, block, position, offset, count, i;
+   if (!points)
+      return index === Infinity? info.length : index;
+   block= Math.min(Math.floor(index / 256), points.length - 1);
+   position= block * 256;
+   offset= points[block];
+   if (info.index <= index && info.index >= position) {
+      position= info.index;
+      offset= info.offset;
+   }
+   while (position < index && offset < info.text.length) {
+      count= Math.min(256 - position % 256, index - position, info.text.length - offset);
+      charge(state, count * 2);
+      for (i= 0; i < count && offset < info.text.length; i++) {
+         offset+= character(info, offset, true);
+         position++;
+      }
+      if (position % 256 === 0 && position / 256 === points.length) {
+         charge(state, 1, 8);
+         points.push(offset);
+      }
+   }
+   info.index= position;
+   info.offset= offset;
+   if (offset === info.text.length)
+      info.length= position;
+   return offset;
+}
+
+// Literal matches must start and end at codepoint boundaries. paired may be
+// inherited from a larger string; false means no surrogate checks are needed.
+function stringBoundary(text, offset, paired) {
+   var first, second;
+   if (!paired || offset === 0 || offset === text.length)
+      return true;
+   first= stringCode.call(text, offset - 1);
+   second= stringCode.call(text, offset);
+   return !(first >= 0xD800 && first <= 0xDBFF && second >= 0xDC00 && second <= 0xDFFF);
+}
+
 function lengthOf(state, value) {
+   var info;
    if (type(value) !== "array" && type(value) !== "string")
       fail(state, "INVALID_TARGET", "Expected an array or string");
-   return value.length;
+   if (typeof value !== "string")
+      return value.length;
+   info= stringInfo(state, value);
+   if (info.length === null)
+      stringOffset(state, info, Infinity);
+   return info.length;
 }
 
 // SLICE reads only its selected span, so pending deletions outside that span do
 // not invalidate it. Returned elements are independent materialized values.
 function slice(state, expression, scope, depth) {
-   var value, offset, count, limit, config, names, reference, result, entries, i, kind, total;
+   var value, offset, count, limit, config, names, reference, result, entries, i, kind, total, info;
    arity(state, expression, 2, 4);
    value= argument(state, expression, 1, scope, depth, borrow);
    if (expression.length === 2 && type(value) === "object") {
@@ -1092,9 +1188,14 @@ function slice(state, expression, scope, depth) {
    kind= type(value);
    if (offset < 0 || offset > limit || limit > total)
       fail(state, "INVALID_TARGET", "SLICE range is out of bounds");
-   charge(state, limit - offset, (limit - offset) * (kind === "string"? 2 : 8));
-   if (kind === "string")
+   if (kind === "string") {
+      info= stringInfo(state, value);
+      offset= stringOffset(state, info, offset);
+      limit= stringOffset(state, info, limit);
+      charge(state, limit - offset, (limit - offset) * 2);
       return stringSlice.call(value, offset, limit);
+   }
+   charge(state, limit - offset, (limit - offset) * 8);
    result= make(state, true);
    entries= make(state, true);
    appendRange(state, entries, value, offset, limit, depth);
@@ -1187,7 +1288,7 @@ function splitConfig(state, source, scope, depth) {
    return result;
 }
 
-function matchPattern(state, text, position, patterns, ending) {
+function matchPattern(state, text, position, patterns, ending, minimum, paired) {
    var best= -1, pattern, start, i;
    if (!patterns)
       return 0;
@@ -1195,8 +1296,9 @@ function matchPattern(state, text, position, patterns, ending) {
    for (i= 0; i < patterns.length; i++) {
       pattern= patterns[i];
       start= ending? position - pattern.length : position;
-      charge(state, pattern.length, pattern.length * 2);
-      if (start >= 0 && pattern.length > best
+      charge(state, pattern.length + (paired? 4 : 0), pattern.length * 2);
+      if (start >= minimum && pattern.length > best
+            && stringBoundary(text, start, paired) && stringBoundary(text, start + pattern.length, paired)
             && stringSlice.call(text, start, start + pattern.length) === pattern)
          best= pattern.length;
    }
@@ -1204,9 +1306,10 @@ function matchPattern(state, text, position, patterns, ending) {
 }
 
 function splitString(state, text, config, depth) {
-   var result= make(state, true), info, split, item, raw, left, right, sep, start= 0, position= 0, matched= -1;
+   var result= make(state, true), info, characters, split, item, raw, left, right, sep, start= 0, position= 0, matched= -1;
    if (typeof text !== "string")
       fail(state, "INVALID_TARGET", "SPLIT requires a string");
+   characters= stringInfo(state, text);
    if (config.variable || !config.discard && (config.left || config.right)) {
       info= arrayInfo(state, result, true);
       split= info.split= make(state);
@@ -1217,19 +1320,19 @@ function splitString(state, text, config, depth) {
    // Include the final remainder. Empty separator matches are skipped at the
    // current boundary and do not add a synthetic trailing empty element.
    while (position <= text.length) {
-      charge(state, 1, 0, 0, depth);
-      matched= matchPattern(state, text, position, config.pattern, false);
+      charge(state, 3, 0, 0, depth);
+      matched= matchPattern(state, text, position, config.pattern, false, 0, characters.checkpoints);
       if (matched < 0 || matched === 0 && position === start) {
          if (position === text.length && start < text.length)
             matched= 0;
          else {
-            position++;
+            position+= position === text.length? 1 : character(characters, position, true);
             continue;
          }
       }
       raw= stringSlice.call(text, start, position);
-      left= Math.max(0, matchPattern(state, raw, 0, config.left, false));
-      right= Math.max(0, matchPattern(state, stringSlice.call(raw, left), raw.length - left, config.right, true));
+      left= Math.max(0, matchPattern(state, raw, 0, config.left, false, 0, characters.checkpoints));
+      right= Math.max(0, matchPattern(state, raw, raw.length, config.right, true, left, characters.checkpoints));
       charge(state, raw.length, raw.length * 2 + 8);
       result.push(stringSlice.call(raw, left, raw.length - right));
       sep= stringSlice.call(text, position, position + matched);
@@ -1243,7 +1346,7 @@ function splitString(state, text, config, depth) {
       start= position + matched;
       if (position === text.length)
          break;
-      position= matched? start : position + 1;
+      position= matched? start : position + character(characters, position, true);
       if (start === text.length && matched) {
          // A nonempty final separator produces a trailing empty element.
          result.push("");

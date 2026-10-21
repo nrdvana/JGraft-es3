@@ -72,8 +72,19 @@ expression behavior for literal separators/trimming and ANY lists of literal
 alternatives, including separator/trim metadata carried by array edits.
 The full SPLIT regex language and its `keep`/`element` options are pending;
 sequence matching, captures, and the remaining expressions are also pending.
-LENGTH counts JavaScript UTF-16 code units. Native Dates can be copied; the specification's other date
+Strings use Unicode codepoints: valid UTF-16 surrogate pairs form one
+character, while lone surrogates remain individual codepoints. LENGTH, SLICE,
+and literal SPLIT use these boundaries. This policy is fixed for this
+implementation. Native Dates can be copied; the specification's other date
 operations and virtual date properties are pending.
+
+String indexing retains the original string and first tests for surrogate
+pairs. Strings without pairs use direct code-unit offsets. Other strings use
+a cursor and UTF-16 offsets recorded every 256 codepoints, built as needed.
+The indexes are shared within an application; no decoded character array is
+allocated. LENGTH and slice-bound normalization can require scanning the whole
+string. Scanning, checkpoint growth, and repeated seeks consume the normal
+resource budgets.
 
 ## Engine and JSON requirements
 
@@ -111,12 +122,14 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 792 COPY/MOVE/SPLICE/MATCH conformance cases,
-the IF subtest, and local implementation tests are active without TODO markers.
-The default adapter explicitly skips the eight cases with `needProto: true`
+`all` runs both in parallel. All 1,149 COPY/MOVE/SPLICE/MATCH/IF/LENGTH/SLICE
+conformance cases and local implementation tests are active without TODO markers.
+The default adapter explicitly skips the ten cases with `needProto: true`
 when `forbidProto` is enabled. Names and descriptions do not affect skipping.
 Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
 restriction; host-restriction tests separately verify rejection on every engine.
+Cases that require lone-surrogate preservation carry `needLoneSurrogate: true`;
+this implementation runs all of them under its fixed codepoint policy.
 
 The optional Mojolicious app `t/serve-tests daemon -l http://*:3000` serves the
 Git-tracked repository files and browser test pages. Mojolicious is not needed
