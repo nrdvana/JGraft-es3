@@ -5,7 +5,8 @@ FROM debian:13
 
 RUN apt-get update && apt-get install -y \
       ca-certificates fontconfig \
-      bzip2 curl gosu node-corepack jq unzip zip lsof procps git perl \
+      bzip2 curl gosu node-corepack jq unzip zip lsof procps \
+      git perl libmojolicious-perl \
  && rm -rf /var/lib/apt/lists/*
 
 # Download PhantomJS 1.9.2

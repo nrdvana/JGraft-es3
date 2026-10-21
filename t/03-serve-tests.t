@@ -44,34 +44,34 @@ sub git {
    return $text;
 }
 
-for my $file (qw(t/serve-tests t/lib/tap.js t/lib/test-util.js src/JGraft.js)) {
+for my $file (qw(t/serve-tests t/lib/tap.js t/lib/TestJGraft.js src/JGraft.js)) {
    copy_file($file);
 }
 write_file('t/lib/tap.css', '.pass { color: green; }');
 write_file('t/10-web.t', <<'JS');
-//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -load => ['../src/JGraft.js', 'lib/helper.js', 'lib/test-util.js'];
+//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJGraft -load => ['../src/JGraft.js', 'lib/helper.js', 'lib/TestJGraft.js'];
 TAP(function(t) {
    t.is(typeof JGraft, 'function', 'library loaded');
    t.is(manualHelper, 42, 'dependency loaded');
-   t.is(typeof TestJS.runConformanceTests, 'function', 'shared namespace loaded');
-   t.is(JSON.parse(TestJS.readFile('../jgraft-spec/data.json')).answer, 42, 'fixture loaded over HTTP');
+   t.is(typeof TestJGraft.runConformanceTests, 'function', 'shared namespace loaded');
+   t.is(JSON.parse(TestJGraft.readFile('../jgraft-spec/data.json')).answer, 42, 'fixture loaded over HTTP');
    t.done_testing();
 });
 JS
 write_file('t/nested/10-web.t', <<'JS');
-//; use TestJS -load => ['../../src/JGraft.js', '../lib/helper.js'];
+//; use TestJGraft -load => ['../../src/JGraft.js', '../lib/helper.js'];
 TAP(function(t) {
    t.is(typeof JGraft, 'function', 'library loaded');
    t.is(manualHelper, 42, 'dependency loaded');
-   t.is(typeof TestJS.runConformanceTests, 'function', 'shared namespace loaded');
-   t.is(JSON.parse(TestJS.readFile('../../jgraft-spec/data.json')).answer, 42, 'nested fixture loaded over HTTP');
+   t.is(typeof TestJGraft.runConformanceTests, 'function', 'shared namespace loaded');
+   t.is(JSON.parse(TestJGraft.readFile('../../jgraft-spec/data.json')).answer, 42, 'nested fixture loaded over HTTP');
    t.done_testing();
 });
 JS
 write_file('t/lib/helper.js', 'var manualHelper= 42;');
 write_file('t/11-perl.t', 'use strict; die "must not execute";');
-write_file('t/12-dynamic.t', '//; use TestJS -load => do { die "must not execute" };');
-write_file('t/a & "quote.t', '//; use TestJS;' . "\nTAP(function(t){t.pass('quoted');t.done_testing();});\n");
+write_file('t/12-dynamic.t', '//; use TestJGraft -load => do { die "must not execute" };');
+write_file('t/a & "quote.t', '//; use TestJGraft;' . "\nTAP(function(t){t.pass('quoted');t.done_testing();});\n");
 write_file('t/secret.txt', 'untracked secret');
 write_file('t/untracked.t', 'untracked test');
 write_file('t/public/leak.txt', 'untracked public file');
@@ -80,7 +80,7 @@ write_file('tracked.txt', 'tracked root file');
 write_file('t/replaced.txt', 'original regular file');
 write_file('t/binary.dat', "\0\1\2\377");
 git($repo, 'init', '-q');
-git($repo, 'add', qw(t/serve-tests t/lib/tap.js t/lib/tap.css t/lib/helper.js t/lib/test-util.js src/JGraft.js),
+git($repo, 'add', qw(t/serve-tests t/lib/tap.js t/lib/tap.css t/lib/helper.js t/lib/TestJGraft.js src/JGraft.js),
    qw(t/10-web.t t/nested/10-web.t t/11-perl.t t/12-dynamic.t), 't/a & "quote.t',
    qw(tracked.txt t/replaced.txt t/binary.dat));
 
@@ -113,13 +113,13 @@ $t->get_ok('/')->status_is(200)
 $t->get_ok('/t/10-web.t')->status_is(200)->content_type_like(qr{text/html})
    ->element_exists('script[src="/t/lib/tap.js"]')
    ->element_exists('script[src="/src/JGraft.js"]')
-   ->element_exists('script[src="/t/lib/test-util.js"]')
+   ->element_exists('script[src="/t/lib/TestJGraft.js"]')
    ->element_exists('script[src="/t/lib/helper.js"]')
    ->element_exists('script[src="/t/10-web.t?raw=1"]')
    ->element_exists('base[href="/t/"]')
    ->element_exists_not('script:not([src])')
-   ->content_unlike(qr/XMLHttpRequest|window\.TestJS=/);
-is($t->tx->res->dom->find('script[src="/t/lib/test-util.js"]')->size, 1,
+   ->content_unlike(qr/XMLHttpRequest|window\.TestJGraft=/);
+is($t->tx->res->dom->find('script[src="/t/lib/TestJGraft.js"]')->size, 1,
    'automatic helper loading does not duplicate a declared dependency');
 $t->get_ok('/t/10-web.t?firebug=1')->status_is(200)
    ->element_exists('script[src="/t/lib/firebug-lite.min.js#startOpened=true,overrideConsole=true"]');

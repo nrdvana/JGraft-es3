@@ -1,4 +1,4 @@
-//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS;
+//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJGraft;
 
 TAP(function(t) {
    // Inspect deliberately failing transcripts without failing this test file.

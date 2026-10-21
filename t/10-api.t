@@ -1,4 +1,4 @@
-//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -load => '../src/JGraft.js';
+//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJGraft -load => '../src/JGraft.js';
 
 TAP(function(t) {
    var graft= new JGraft(['JGRAFT', {v: 1}, ['COPY', 2, 'value']]);

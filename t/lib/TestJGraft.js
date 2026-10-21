@@ -1,4 +1,4 @@
-// TestJS.runConformanceTests(t, filenameOrSuite[, apply]) runs one suite as a TAP subtest.
+// TestJGraft.runConformanceTests(t, filenameOrSuite[, apply]) runs one suite as a TAP subtest.
 // Filenames are relative to the test file. Inline suites may contain Dates.
 // apply(input, graft, limits) returns the output or throws an error with .code.
 // String error codes are also accepted. Supplying apply lets this helper be
@@ -7,12 +7,51 @@
 "use strict";
 
 // Keep host-provided methods, such as the Node/Phantom filesystem bridge.
-var TestJS= global.TestJS || (global.TestJS= {});
+var TestJGraft= global.TestJGraft || (global.TestJGraft= {});
+
+// Private project helpers, shared by the browser and engine entrypoints.
+// Loading this file only installs helpers; an entrypoint starts the runner.
+if (typeof module !== "undefined" && module.exports)
+   module.exports= TestJGraft;
+
+// Keep argument parsing, TAP diagnostics and completion polling identical in
+// both engines. readState bridges the Phantom page or reads Node's TAP root.
+TestJGraft.createRunner= function(args, finish, readState) {
+   var scripts= [], timeout= 10000, startTime= new Date().getTime(), i, match;
+   function diagnostic(message) {
+      console.log(String(message).replace(/^/gm, "# "));
+   }
+   function fail(message) {
+      diagnostic(message);
+      finish(1);
+   }
+   function pollFinished() {
+      var state= readState();
+      if (state && state.finished)
+         finish(state.success? 0 : 1);
+      else if (new Date().getTime() - startTime >= timeout) {
+         diagnostic("Timeout (" + timeout + "ms) waiting for TAP.root.done_testing()");
+         finish(2);
+      } else
+         setTimeout(pollFinished, 10);
+   }
+   for (i= 0; i < args.length; i++) {
+      match= /^--timeout=([1-9][0-9]*)$/.exec(args[i]);
+      if (match)
+         timeout= Number(match[1]);
+      else
+         scripts.push(args[i]);
+   }
+   if (!scripts.length)
+      fail("Usage: engine run-ENGINE.js [--timeout=MS] tap.js [library.js ...] test.t");
+   return {scripts: scripts, testFile: scripts[scripts.length - 1],
+      diagnostic: diagnostic, fail: fail, pollFinished: pollFinished};
+};
 
 // HTTP tests use the document base URL supplied by the manual test server.
 // Synchronous reads match the local harness and keep conformance tests simple.
-if (typeof TestJS.readFile !== "function" && typeof global.XMLHttpRequest !== "undefined") {
-   TestJS.readFile= function(filename) {
+if (typeof TestJGraft.readFile !== "function" && typeof global.XMLHttpRequest !== "undefined") {
+   TestJGraft.readFile= function(filename) {
       var xhr= new global.XMLHttpRequest();
       xhr.open("GET", filename, false);
       xhr.send(null);
@@ -152,7 +191,7 @@ function applyGraft(input, graft, limits) {
 function runConformanceTests(t, source, apply) {
    var suite, i;
    try {
-      suite= typeof source === "string"? JSON.parse(TestJS.readFile(source)) : source;
+      suite= typeof source === "string"? JSON.parse(TestJGraft.readFile(source)) : source;
       if (!suite || suite.version !== 1 || typeof suite.name !== "string"
             || tag(suite.tests) !== "[object Array]" || !suite.tests.length)
          throw new Error("Expected a version 1 conformance suite with a name and nonempty tests array");
@@ -173,7 +212,7 @@ function runConformanceTests(t, source, apply) {
    });
 }
 
-TestJS.runConformanceTests= runConformanceTests;
+TestJGraft.runConformanceTests= runConformanceTests;
 
 })(typeof window !== "undefined"? window
    : typeof global !== "undefined"? global

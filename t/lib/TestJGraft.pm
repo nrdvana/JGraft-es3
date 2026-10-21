@@ -1,4 +1,4 @@
-package TestJS;
+package TestJGraft;
 use strict;
 use warnings;
 use Cwd qw(abs_path);
@@ -13,7 +13,7 @@ use Time::HiRes qw(time sleep);
 my @engines= qw(phantomjs node);
 
 # Tests are JavaScript files whose first line is also a Perl program:
-# //; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS;
+# //; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJGraft;
 # import runs the original file and exits before Perl parses the JavaScript.
 # -load accepts a filename or array of filenames, relative to the test file.
 # TESTJS selects phantomjs, node, or all. By default, use the first installed
@@ -25,13 +25,13 @@ sub import {
    my @load;
    while (@options) {
       my $option= shift @options;
-      @options or die "Missing value for TestJS option '$option'\n";
+      @options or die "Missing value for TestJGraft option '$option'\n";
       my $value= shift @options;
       if ($option eq '-load') {
          push @load, ref($value) eq 'ARRAY'? @$value : $value;
       }
       elsif ($option ne '-js') {
-         die "Unknown TestJS option '$option'\n";
+         die "Unknown TestJGraft option '$option'\n";
       }
       # Legacy -js heredocs remain valid; execute the original file instead.
    }
@@ -123,9 +123,11 @@ sub run_test {
    my $dir= dirname($file);
    @load= map {
       my $path= File::Spec->rel2abs($_, $dir);
-      -f $path or die "TestJS dependency does not exist: $path\n";
+      -f $path or die "TestJGraft dependency does not exist: $path\n";
       $path;
    } @load;
+   # The shared helper is always available, just as in the browser wrapper.
+   @load= grep { abs_path($_) ne "$lib/TestJGraft.js" } @load;
    my $mode= $ENV{TESTJS};
    unless ($mode) {
       ($mode)= grep {
@@ -135,15 +137,15 @@ sub run_test {
             -f $path && -x $path;
          } File::Spec->path;
       } @engines;
-      defined $mode or die "TestJS requires phantomjs or node installed in PATH\n";
+      defined $mode or die "TestJGraft requires phantomjs or node installed in PATH\n";
    }
    $mode eq 'all' || grep { $_ eq $mode } @engines
       or die "Unknown TESTJS engine '$mode' (expected @engines or all)\n";
    my $timeout= defined $ENV{TESTJS_TIMEOUT}? $ENV{TESTJS_TIMEOUT} : 10000;
    $timeout =~ /\A[1-9][0-9]*\z/ or die "TESTJS_TIMEOUT must be a positive integer\n";
    my @runs= map {
-      start_engine($_, $timeout, "$lib/run-test.js", "--timeout=$timeout",
-         "$lib/tap.js", @load, $file);
+      start_engine($_, $timeout, "$lib/run-$_.js", "--timeout=$timeout",
+         "$lib/tap.js", "$lib/TestJGraft.js", @load, $file);
    } $mode eq 'all'? @engines : ($mode);
    collect_engines($timeout, @runs);
    if ($mode ne 'all') {

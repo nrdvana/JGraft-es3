@@ -25,7 +25,7 @@ sub run_fixture {
    my ($engine, $name, $source, $options, $timeout)= @_;
    my $file= File::Spec->catfile($dir, "$name.t");
    open my $fh, '>', $file or die "Cannot write $file: $!";
-   print {$fh} '//; use lib ', perl_string($lib), '; use TestJS',
+   print {$fh} '//; use lib ', perl_string($lib), '; use TestJGraft',
       ($options || ''), ";\n", $source;
    close $fh or die "Cannot close $file: $!";
    local $ENV{TESTJS}= $engine;
@@ -42,7 +42,7 @@ sub run_fixture {
 chdir $dir or die "Cannot chdir to $dir: $!";
 my $dependency= "helper with ' and spaces.js";
 open my $fh, '>', $dependency or die "Cannot write helper: $!";
-print {$fh} "var testJSHelper= 42;\n";
+print {$fh} "var testJGraftHelper= 42;\n";
 close $fh or die "Cannot close helper: $!";
 
 for my $engine (qw(phantomjs node)) {
@@ -51,7 +51,7 @@ for my $engine (qw(phantomjs node)) {
          -x File::Spec->catfile($_, $engine)
       } File::Spec->path;
       my ($status, $output, $file)= run_fixture($engine, "pass with ' and spaces",
-         "TAP(function(t) { t.is(testJSHelper, 42, 'relative dependency'); t.done_testing(); });\n",
+         "TAP(function(t) { t.is(testJGraftHelper, 42, 'relative dependency'); t.done_testing(); });\n",
          ' -load => ' . perl_string($dependency));
       is($status, 0, 'loads a relative dependency from another working directory');
       like($output, qr/^ok 1 - relative dependency$/m, 'reports TAP results');
@@ -177,7 +177,7 @@ subtest 'default engine selection' => sub {
    unlink "$bin/node" or die "Cannot remove stand-in Node: $!";
    ($status, $output)= run_fixture(undef, 'default neither', '');
    isnt($status, 0, 'default fails when neither engine is available');
-   like($output, qr/TestJS requires phantomjs or node installed in PATH/,
+   like($output, qr/TestJGraft requires phantomjs or node installed in PATH/,
       'explains that an engine is required');
 };
 

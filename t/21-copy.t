@@ -1,4 +1,4 @@
-//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -load => ['../src/JGraft.js', 'lib/test-util.js'];
+//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJGraft -load => '../src/JGraft.js';
 
 TAP(function(t) {
    function run(input, action, options) {
@@ -16,7 +16,7 @@ TAP(function(t) {
       return Object.getOwnPropertyDescriptor(value, key).value;
    }
 
-   TestJS.runConformanceTests(t, {
+   TestJGraft.runConformanceTests(t, {
       version: 1,
       name: 'Native Date COPY',
       tests: [

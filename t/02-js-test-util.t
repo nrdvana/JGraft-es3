@@ -1,14 +1,14 @@
-//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJS -load => ['../src/JGraft.js', 'lib/test-util.js'];
+//; use lib do { (my $x= __FILE__) =~ s{[^/]+\z}{lib}; $x }; use TestJGraft -load => ['../src/JGraft.js', 'lib/TestJGraft.js'];
 
 TAP(function(t) {
-   t.subtest('shared TestJS namespace', function(t) {
-      var namespace= TestJS, reader= TestJS.readFile;
+   t.subtest('shared TestJGraft namespace', function(t) {
+      var namespace= TestJGraft, reader= TestJGraft.readFile;
       // Re-evaluation must extend the host namespace without replacing its
       // filesystem bridge (or its browser HTTP reader).
-      (0, eval)(reader('lib/test-util.js'));
-      t.ok(TestJS === namespace, 'preserves the namespace object');
-      t.ok(TestJS.readFile === reader, 'preserves the installed file reader');
-      t.is(typeof TestJS.runConformanceTests, 'function', 'exports the descriptive runner name');
+      (0, eval)(reader('lib/TestJGraft.js'));
+      t.ok(TestJGraft === namespace, 'preserves the namespace object');
+      t.ok(TestJGraft.readFile === reader, 'preserves the installed file reader');
+      t.is(typeof TestJGraft.runConformanceTests, 'function', 'exports the descriptive runner name');
    });
    // Exercise the real TAP objects without emitting intentionally failing TAP
    // into this test's output. The captured results remain available to inspect.
@@ -16,7 +16,7 @@ TAP(function(t) {
       var root= new TAP(), emit= TAP.prototype.emit;
       TAP.prototype.emit= function() {};
       try {
-         TestJS.runConformanceTests(root, source, apply);
+         TestJGraft.runConformanceTests(root, source, apply);
       } finally {
          TAP.prototype.emit= emit;
       }
@@ -132,7 +132,7 @@ TAP(function(t) {
          '../jgraft-spec/conformance/03-splice.json'
       ];
       for (var i= 0; i < paths.length; i++) {
-         var suite= JSON.parse(TestJS.readFile(paths[i]));
+         var suite= JSON.parse(TestJGraft.readFile(paths[i]));
          var result= capture(paths[i], function() { throw 'INVALID_TARGET'; });
          t.is(result.results.length, suite.tests.length, suite.name + ': every case runs despite failures');
       }

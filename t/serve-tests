@@ -90,13 +90,13 @@ HTML
 }
 
 # Read literal -load declarations without evaluating Perl or executing tests.
-# Both quoted filenames and arrays of quoted filenames match the TestJS preamble.
+# Both quoted filenames and arrays of quoted filenames match the TestJGraft preamble.
 sub test_dependencies {
    my ($file)= @_;
    open my $fh, '<', $file or die "Cannot read test: $!\n";
    my $header= <$fh>;
    close $fh;
-   return unless defined $header && $header =~ m{\A//;.*\buse\s+TestJS\b(.*)};
+   return unless defined $header && $header =~ m{\A//;.*\buse\s+TestJGraft\b(.*)};
    my $options= $1;
    my $quoted= qr/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/;
    my $value= qr/(?:$quoted|\[\s*(?:$quoted\s*(?:,\s*$quoted\s*)*,?)?\])/;
@@ -150,7 +150,7 @@ get '/*file' => sub {
       if (!defined $load) {
          $body .= qq{    <p>This is a Perl-only test. Run it with prove.</p>\n};
       } else {
-         my @scripts= ('/t/lib/tap.js', '/t/lib/test-util.js');
+         my @scripts= ('/t/lib/tap.js', '/t/lib/TestJGraft.js');
          my %seen= map { $_ => 1 } @scripts;
          for my $dependency (@$load) {
             my $path= normalize(dirname($relative) . '/' . $dependency);
