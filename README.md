@@ -45,7 +45,9 @@ units, not exact heap measurements. Raising the depth limit beyond the host
 engine's available stack can cause a native stack overflow.
 
 Failures throw an `Error` with `code`, `graftPath`, `inputPath`, `partial`, and
-`counts`. Resource failures additionally identify the counter in `resource`.
+`counts`, plus a `limits` snapshot of the effective resource configuration.
+Resource failures additionally identify the counter in `resource`. Editing the
+snapshot does not change the instance's limits.
 `partial` contains preceding edits and can share untouched input subtrees;
 diagnostic trees are not defensively cloned. Paths inside temporary or constant
 namespaces describe the location in that namespace. Invalid resource
@@ -66,12 +68,15 @@ failure while committing an edit can still leave a partially edited result.
 
 Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
 HAS, IS, NONE, ANY, ALL, EXISTS, NODE/TEMP/STASH/CONST/CAP references,
-EXPR expansion, LOCAL, NOT, LENGTH,
+EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CAPTURE,
+LOCAL, NOT, LENGTH,
 SLICE, CONCAT, and FAIL. There is supporting SPLIT action/expression and JOIN
 expression behavior for literal separators/trimming and ANY lists of literal
 alternatives, including separator/trim metadata carried by array edits.
-The full SPLIT regex language and its `keep`/`element` options are pending;
-sequence matching, captures, and the remaining expressions are also pending.
+Array and string sequences share the matcher, including ALL successor coverage,
+repetition, capture preferences, and MATCH/IF capture namespaces. The full SPLIT
+regex language, its `keep`/`element` options, character classes, and the remaining
+expressions are pending.
 Strings use Unicode codepoints: valid UTF-16 surrogate pairs form one
 character, while lone surrogates remain individual codepoints. LENGTH, SLICE,
 and literal SPLIT use these boundaries. This policy is fixed for this

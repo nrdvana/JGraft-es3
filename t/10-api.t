@@ -44,7 +44,15 @@ TAP(function(t) {
    }
    t.is(error.code, 'RESOURCE_LIMIT', 'constructor captures configured resource limits');
    t.is(error.resource, 'ops', 'limit error identifies the counter');
+   t.is(error.limits.ops, 0, 'error records the effective exhausted budget');
+   t.ok(typeof error.limits.mem === 'number' && typeof error.limits.depth === 'number', 'errors include default limits too');
    t.is(error.counts, graft.counts, 'early failures publish their counters');
    t.is(error.partial, input, 'early failure retains the original root');
+   var firstLimit= error;
+   firstLimit.limits.ops= Infinity;
+   try {graft.apply(input);} catch (secondLimit) {error=secondLimit;}
+   t.is(error.code, 'RESOURCE_LIMIT', 'editing diagnostic limits cannot alter the instance budget');
+   t.is(error.limits.ops, 0, 'subsequent errors retain the configured limit');
+   t.ok(error.limits !== firstLimit.limits, 'each error has its own limits snapshot');
    t.done_testing();
 });
