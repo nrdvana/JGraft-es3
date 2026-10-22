@@ -8,16 +8,27 @@ var objectTag= Object.prototype.toString;
 var defineProperty= Object.defineProperty;
 var getDescriptor= Object.getOwnPropertyDescriptor;
 var dateTime= Date.prototype.getTime;
+var dateYear= Date.prototype.getUTCFullYear;
+var dateGetters= [dateYear, Date.prototype.getUTCMonth, Date.prototype.getUTCDate,
+   Date.prototype.getUTCHours, Date.prototype.getUTCMinutes, Date.prototype.getUTCSeconds,
+   Date.prototype.getUTCMilliseconds];
+var dateFields= ["year", "month", "day", "hour", "minute", "second", "tz_offset"];
+var datePattern= /^([+-]?[0-9]{4,})(-?)([0-9]{2})-?([0-9]{2})(?:[T ]([0-9]{2}):?([0-9]{2}):?([0-9]{2})(?:[.,]([0-9]+))?(?:(Z)|([+\-\u2212])([0-9]{2})(?::?([0-9]{2}))?)?)?(?![\s\S])/;
 var stringSlice= String.prototype.slice;
 var stringCode= String.prototype.charCodeAt;
 var regexpTest= RegExp.prototype.test;
 var surrogatePair= /[\uD800-\uDBFF][\uDC00-\uDFFF]/;
+// An absolute end assertion avoids JavaScript's $ accepting a final newline.
+var jsonNumber= /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?(?![\s\S])/;
+var nonzeroMantissa= /^[^eE]*[1-9]/;
 var defaults= {mem: 67108864, ops: 1000000, new_obj: 100000, depth: 128};
 var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6};
 var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
-   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, STR: 8, SEQ: 13, SEQMAX: 14, SEQMIN: 15,
+   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11,
+   SEQ: 13, SEQMAX: 14, SEQMIN: 15,
    REP: 16, START: 17, END: 18, CAPTURE: 50,
-   LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, FAIL: 67};
+   LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, FAIL: 67,
+   CASTBOOL: 68, CASTNUM: 69, CASTSTR: 70, CASTDATE: 71};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
 // Checking an inherited sentinel also works when descriptors are unavailable.
 var protoProbe= {};
@@ -59,11 +70,213 @@ function get(value, key) {
 function type(value) {
    return value === null? "null" : typeof value !== "object"? typeof value
       : objectTag.call(value) === "[object Array]"? "array"
-      : objectTag.call(value) === "[object Date]"? "date" : "object";
+      : value instanceof DateValue || objectTag.call(value) === "[object Date]"? "date" : "object";
 }
 
 function integer(value) {
    return typeof value === "number" && isFinite(value) && Math.floor(value) === value;
+}
+
+// Private immutable date values retain calendar precision, leap seconds, and
+// the original minute offset. They are never exposed in the target tree.
+function DateValue(state, parts, count) {
+   charge(state, 1, 48, 1);
+   this.parts= parts;
+   this.count= count;
+   state.dates= true;
+}
+
+function monthDays(year, month) {
+   return month === 2? year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)? 29 : 28
+      : month === 4 || month === 6 || month === 9 || month === 11? 30 : 31;
+}
+
+// Truncate decimal digits before numeric conversion, avoiding binary rounding
+// of a millisecond-exact field or a carry into the next second/day.
+function dateSecond(state, whole, fraction) {
+   var removed= stringSlice.call(fraction, state.dateDigits);
+   if (!state.truncateDateResolution && regexpTest.call(nonzeroMantissa, removed))
+      fail(state, "UNSUPPORTED_GRAFT", "Date resolution would lose fractional seconds");
+   return state.dateDigits && fraction? Number(whole + "." + stringSlice.call(fraction, 0, state.dateDigits)) : whole;
+}
+
+// Borrow internal values, or extract a native Date using trusted UTC methods.
+// Native Dates represent timestamps; their mutability stays outside expressions.
+function dateRecord(state, value) {
+   var parts, i;
+   if (value instanceof DateValue) return value;
+   if (type(value) !== "date" || !isFinite(dateTime.call(value)))
+      fail(state, "INVALID_TARGET", "Expected a valid date");
+   parts= make(state, true);
+   charge(state, 24, 96);
+   for (i= 0; i < 6; i++) parts[i]= dateGetters[i].call(value);
+   parts[1]++;
+   parts[5]= Number(parts[5] + "." + datePad(dateGetters[6].call(value), 3));
+   parts[6]= 0;
+   return new DateValue(state, parts, 7);
+}
+
+function dateProperty(state, value, key) {
+   var record= dateRecord(state, value), i;
+   charge(state, record.count);
+   for (i= 0; i < record.count; i++)
+      if (dateFields[i] === key) return record.parts[i];
+   fail(state, "INVALID_TARGET", "Missing virtual date property");
+}
+
+// Parse only unambiguous required forms and numeric field objects. Validation
+// precedes resolution loss, so truncation cannot repair an invalid date/time.
+function castDate(state, value) {
+   var kind= type(value), parts, count= 3, matched, i, second, fraction= "", text;
+   if (value instanceof DateValue) return value;
+   if (kind === "date") {
+      if (!isFinite(dateTime.call(value))) fail(state, "INVALID_TARGET", "Invalid native Date");
+      return copy(state, value, 1);
+   }
+   parts= make(state, true);
+   charge(state, 7, 56);
+   if (kind === "string") {
+      charge(state, value.length * 5, value.length * 4 + 512, 1);
+      matched= datePattern.exec(value);
+      text= matched? matched[1] : "";
+      if (!matched || text.length - (stringCode.call(text, 0) === 43 || stringCode.call(text, 0) === 45? 1 : 0) > 4 && !matched[2])
+         fail(state, "INVALID_TARGET", "Invalid date string");
+      parts[0]= Number(matched[1]);
+      if (!isFinite(parts[0])) fail(state, "UNSUPPORTED_GRAFT", "Date year is outside the host numeric range");
+      parts[1]= Number(matched[3]);
+      parts[2]= Number(matched[4]);
+      for (i= 3; i < 6; i++) parts[i]= matched[i + 2] === undefined? 0 : Number(matched[i + 2]);
+      fraction= matched[8] || "";
+      parts[6]= 0;
+      if (matched[5] !== undefined) count= 6;
+      if (matched[9] || matched[10]) {
+         count= 7;
+         if (matched[10]) {
+            if (Number(matched[11]) > 23 || Number(matched[12] || 0) > 59)
+               fail(state, "INVALID_TARGET", "Invalid timezone offset");
+            parts[6]= Number(matched[11]) * 60 + Number(matched[12] || 0);
+            if (matched[10] !== "+") {
+               if (!parts[6]) fail(state, "INVALID_TARGET", "Negative zero timezone");
+               parts[6]= -parts[6];
+            }
+         }
+      }
+   } else if (kind === "object") {
+      for (i= 0; i < 7; i++) {
+         parts[i]= owns(value, dateFields[i])? get(value, dateFields[i]) : i === 1 || i === 2? 1 : i? 0 : undefined;
+         if (i >= 3 && owns(value, dateFields[i])) count= i === 6? 7 : Math.max(count, 6);
+      }
+   } else
+      fail(state, "INVALID_TARGET", "Cannot infer a date from this value");
+   for (i= 0; i < 7; i++) {
+      if (i === 5? typeof parts[i] !== "number" || !isFinite(parts[i]) : !integer(parts[i]))
+         fail(state, "INVALID_TARGET", "Date fields must be numeric");
+   }
+   if (parts[1] < 1 || parts[1] > 12 || parts[2] < 1 || parts[2] > monthDays(parts[0], parts[1])
+         || parts[3] < 0 || parts[3] > 23 || parts[4] < 0 || parts[4] > 59
+         || parts[5] < 0 || parts[5] >= 61 || Math.abs(parts[6]) > 1439)
+      fail(state, "INVALID_TARGET", "Date fields are out of range");
+   second= Math.floor(parts[5]);
+   if (kind === "object" && parts[5] !== second) {
+      charge(state, 1, 64);
+      // Nonzero scientific spellings here are below one millisecond.
+      text= String(parts[5]);
+      fraction= text.indexOf("e") !== -1? "0001" : stringSlice.call(text, text.indexOf(".") + 1);
+   }
+   parts[5]= dateSecond(state, second, fraction);
+   return new DateValue(state, parts, count);
+}
+
+// Native Date years fit six digits; internal years can use the whole supported
+// numeric range. Padding never removes digits or changes calendar fields.
+function datePad(value, width) {
+   var text= String(value);
+   while (text.length < width) text= "0" + text;
+   return text;
+}
+
+function dateString(state, value) {
+   var parts= value.parts, year= Math.abs(parts[0]), text, second, offset= parts[6];
+   charge(state, 128, 1024);
+   text= year >= 1e21? scalarString(state, year) : String(year);
+   charge(state, text.length * 10, text.length * 20);
+   text= (parts[0] < 0? "-" : parts[0] > 9999? "+" : "")
+      + datePad(text, parts[0] < 0 || parts[0] > 9999? 6 : 4)
+      + "-" + datePad(parts[1], 2) + "-" + datePad(parts[2], 2);
+   if (value.count > 3) {
+      second= (parts[5] < 10? "0" : "") + String(parts[5]);
+      text+= (value.count === 7? "T" : " ") + datePad(parts[3], 2) + ":" + datePad(parts[4], 2) + ":" + second;
+   }
+   if (value.count === 7)
+      text+= !offset? "Z" : (offset < 0? "-" : "+") + datePad(Math.floor(Math.abs(offset) / 60), 2)
+         + datePad(Math.abs(offset) % 60, 2);
+   return text;
+}
+
+// Normalize only minute offsets. Seconds (including leap seconds) stay intact;
+// a zone within one day needs at most one calendar-day boundary adjustment.
+function dateComparable(state, value, depth) {
+   var parts= value.parts, minute, day;
+   if (value.count !== 7 || !parts[6]) return parts;
+   parts= copy(state, parts, depth, true);
+   minute= parts[3] * 60 + parts[4] - parts[6];
+   parts[2]+= Math.floor(minute / 1440);
+   minute= (minute % 1440 + 1440) % 1440;
+   parts[3]= Math.floor(minute / 60);
+   parts[4]= minute % 60;
+   parts[6]= 0;
+   if (parts[2] < 1) {
+      if (--parts[1] < 1) {parts[1]= 12; parts[0]--;}
+      parts[2]+= monthDays(parts[0], parts[1]);
+   } else {
+      day= monthDays(parts[0], parts[1]);
+      if (parts[2] > day) {
+         parts[2]-= day;
+         if (++parts[1] > 12) {parts[1]= 1; parts[0]++;}
+      }
+   }
+   return parts;
+}
+
+function dateEqual(state, left, right, depth) {
+   var a= dateRecord(state, left), b= dateRecord(state, right), i;
+   if (a.count !== b.count) return false;
+   left= dateComparable(state, a, depth);
+   right= dateComparable(state, b, depth);
+   charge(state, a.count);
+   for (i= 0; i < a.count; i++)
+      if (left[i] !== right[i]) return false;
+   return true;
+}
+
+// Only parents containing private dates change. Such parents are owned:
+// expressions copy containers, and inserting a private date into shared input
+// first clones its parents. MOVE retains array identity/pending metadata here.
+function exportDates(state, value, depth) {
+   var kind= type(value), names, key, child, converted, info, queue, i, j;
+   charge(state, 1, 0, 0, depth);
+   if (value instanceof DateValue) return dateString(state, value);
+   if (kind !== "array" && kind !== "object") return value;
+   names= keys(state, value);
+   charge(state, names.length);
+   for (i= 0; i < names.length; i++) {
+      key= names[i];
+      child= get(value, key);
+      converted= exportDates(state, child, depth + 1);
+      if (converted !== child) put(state, value, key, converted);
+   }
+   info= kind === "array" && state.moving? arrayInfo(state, value) : null;
+   if (info && info.inserts) {
+      names= keys(state, info.inserts);
+      charge(state, names.length);
+      for (i= 0; i < names.length; i++) {
+         queue= get(info.inserts, names[i]);
+         charge(state, queue.length);
+         for (j= 0; j < queue.length; j++)
+            queue[j].value= exportDates(state, queue[j].value, depth + 1);
+      }
+   }
+   return value;
 }
 
 // Probe at construction so installing a replacement parser changes the default
@@ -91,6 +304,11 @@ function JGraft(graft, config) {
    if (typeof value !== "boolean")
       throw new TypeError("Invalid JGraft forbidProto option");
    this.forbidProto= value;
+   this._dateDigits= dateTime.call(new Date(1)) === 1? 3 : 0;
+   value= owns(config, "truncateDateResolution")? get(config, "truncateDateResolution") : this._dateDigits >= 3;
+   if (typeof value !== "boolean")
+      throw new TypeError("Invalid JGraft truncateDateResolution option");
+   this.truncateDateResolution= value;
    // Copy scalar limits so later changes to config cannot change this budget.
    for (key in defaults) {
       value= owns(supplied, key)? get(supplied, key) : defaults[key];
@@ -193,6 +411,7 @@ function holder(state, value, cloned) {
 
 function createState(instance, input) {
    var state= {input: input, limits: instance._limits, forbidProto: instance.forbidProto,
+      dateDigits: instance._dateDigits, truncateDateResolution: instance.truncateDateResolution,
       counts: {mem: 0, ops: 0, new_obj: 0, depth: 0},
       graftPath: [], inputPath: []};
    // Publish before any limit check so failed attempts also expose counts.
@@ -210,9 +429,16 @@ function copy(state, value, depth, shallow, scope) {
    var kind= type(value), result, names, i, key, info, target;
    charge(state, 1, 0, 0, depth);
    if (kind === "date") {
+      if (value instanceof DateValue) return value;
       // Dates are mutable in JavaScript, so a copied value needs its own Date.
       charge(state, 1, 48, 1);
-      return new Date(dateTime.call(value));
+      result= dateTime.call(value);
+      if (!state.dateDigits && isFinite(result) && result % 1000) {
+         if (!state.truncateDateResolution)
+            fail(state, "UNSUPPORTED_GRAFT", "Date resolution would lose milliseconds");
+         result= Math.floor(result / 1000) * 1000;
+      }
+      return new Date(result);
    }
    if (kind === "array" || kind === "object") {
       result= make(state, kind === "array");
@@ -368,6 +594,8 @@ function selector(state, parent, key, writing) {
          return key;
    } else if (kind === "object" && typeof key === "string")
       return key;
+   else if (kind === "date" && !writing && typeof key === "string")
+      return key;
    fail(state, "INVALID_TARGET", "Path selector does not address this container");
 }
 
@@ -381,11 +609,15 @@ function read(state, reference, depth) {
       charge(state, 1, 0, 0, depth + i);
       key= selector(state, value, reference.keys[i], false);
       state.inputPath.push(key);
-      if (!present(state, value, key))
-         fail(state, "INVALID_TARGET", "Missing or pending-deletion source property");
+      if (type(value) === "date")
+         value= dateProperty(state, value, key);
+      else {
+         if (!present(state, value, key))
+            fail(state, "INVALID_TARGET", "Missing or pending-deletion source property");
+         value= get(value, key);
+      }
       // AT retains these concrete indices rather than re-resolving aliases.
       reference.keys[i]= key;
-      value= get(value, key);
    }
    return value;
 }
@@ -498,6 +730,8 @@ function revive(state, array, key) {
 // the original marker, so modifying a moved shared branch still shallow-clones.
 function write(state, reference, value, depth, owned, element) {
    var parent, key, inserting;
+   if (state.dates && reference.tree === state.tree)
+      value= exportDates(state, value, depth);
    if (owned === undefined)
       owned= true;
    if (!reference.keys.length) {
@@ -637,6 +871,8 @@ function move(state, expression, scope, depth) {
       if (target) {
          key= target.keys[target.keys.length - 1];
          if (typeof key === "number" && !integer(key)) {
+            if (state.dates && target.tree === state.tree)
+               item.value= exportDates(state, item.value, depth);
             parent= edit(state, parentReference(state, target), depth, true, key);
             info= pending(state, parent.value, parent.mark);
             if (item.element && !acceptElement(state, info, item.element))
@@ -820,6 +1056,8 @@ function splice(state, expression, scope, depth) {
    charge(state, expression.length);
    for (i= 3; i < expression.length; i++) {
       entries= argument(state, expression, i, scope, depth);
+      if (state.dates && reference.tree === state.tree)
+         entries= exportDates(state, entries, depth);
       entry(state, replacements, entries, true, state.element);
    }
    // Every replacement was captured before cloning or altering the array.
@@ -1287,7 +1525,7 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
          }
          return sequenceElement(state, expression, scope, depth, mode, cursor, position, 0);
       }
-      if (cursor.info && (id === null || id < 1 || id > 18 || mode & 4 && id !== 6 && id !== 8)) {
+      if (cursor.info && (id === null || id < 1 || id > 18 || mode & 4 && (id < 6 || id > 11))) {
          if (id !== null || mode & 4) {
             expression= borrow(state, expression, scope, depth + 1);
             kind= type(expression);
@@ -1313,12 +1551,12 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
    return sequenceElement(state, expression, scope, depth, mode, cursor, position, 1);
 }
 
-// Evaluate root sequence names before matching this array, with NODE missing.
+// Evaluate root sequence names from start before matching, with NODE missing.
 // Suppressed/boolean matches never evaluate names or allocate descriptors.
-function sequenceGroups(state, expression, scope, depth) {
+function sequenceGroups(state, expression, scope, depth, start) {
    var i, term, id, level, groups= null, local, group, name;
    charge(state, expression.length);
-   for (i= 0; i < expression.length; i++) {
+   for (i= start || 0; i < expression.length; i++) {
       term= get(expression, i);
       level= depth;
       do {
@@ -1411,16 +1649,56 @@ function sequenceAll(state, positions, branches, prefix, cursor) {
 
 // Compose consecutive terms over their frontier sets. Structural arrays start
 // at element zero; SEQ skips its opcode. Duplicate paths collapse by position.
-function sequenceTerms(state, expression, scope, depth, options, cursor, start) {
+// ARRAY skips two operands and explicitly marks a fresh capture-group root.
+function sequenceTerms(state, expression, scope, depth, options, cursor, start, root) {
    var i, positions= Math.floor(options / 32), mode= options & 31;
-   if (!start && state.captures && !(mode & 2))
-      cursor.groups= sequenceGroups(state, expression, scope, depth);
+   root= root || !start;
+   if (root && state.captures && !(mode & 2))
+      cursor.groups= sequenceGroups(state, expression, scope, depth, start);
    charge(state, expression.length);
    for (i= start; i < expression.length && positions !== -1; i++) {
-      if (!start) cursor.group= i;
+      if (root) cursor.group= i;
       positions= sequenceApply(state, expression, i, scope, depth, mode, cursor, positions);
    }
    return positions;
+}
+
+// ARRAY has already borrowed an array target and has at least one operand.
+// Reuse its cursor without constructing skipped EXISTS terms or slicing data.
+// Prefix/suffix presence checks preserve the equivalent escaped-array behavior
+// during pending MOVE deletions; matched terms may explicitly probe such holes.
+function arrayMatch(state, expression, scope, depth, mode, value) {
+   var offset= argument(state, expression, 1, scope, depth, borrow), minimum= 0, cursor, i;
+   if (!integer(offset))
+      fail(state, "INVALID_OPERAND", "ARRAY requires an integer length or offset");
+   if (expression.length === 2)
+      return mode & 1? value.length === offset : value.length >= offset;
+   offset= offset < 0? value.length + offset : offset;
+   if (offset < 0 || offset > value.length)
+      return false;
+   charge(state, offset);
+   for (i= 0; i < offset; i++)
+      if (!present(state, value, i)) return false;
+   if (mode & 1) {
+      charge(state, value.length - offset);
+      for (minimum= value.length; minimum > offset && present(state, value, minimum - 1); minimum--) {}
+   }
+   cursor= sequenceCursor(state, scope, value);
+   i= sequenceTerms(state, expression, scope, depth,
+      offset * 32 + (mode & 1), cursor, 2, true);
+   return sequenceResolve(state, i, cursor, minimum);
+}
+
+// NUM has borrowed a numeric target. Null/absent bounds omit comparisons;
+// all supplied bounds are checked before comparing, including reversed ranges.
+function numberMatch(state, expression, scope, depth, value) {
+   var minimum= expression.length > 1? argument(state, expression, 1, scope, depth, borrow) : null;
+   var maximum= expression.length > 2? argument(state, expression, 2, scope, depth, borrow) : null;
+   if (minimum !== null && (typeof minimum !== "number" || !isFinite(minimum))
+         || maximum !== null && (typeof maximum !== "number" || !isFinite(maximum))
+         || minimum !== null && maximum !== null && minimum > maximum)
+      fail(state, "INVALID_OPERAND", "NUM requires ordered finite numeric bounds or null");
+   return (minimum === null || value >= minimum) && (maximum === null || value <= maximum);
 }
 
 // mode bits: 1 = exact, 2 = already-evaluated literal, 4 = EXPR definition
@@ -1436,14 +1714,24 @@ function matchValue(state, expression, scope, depth, mode, target) {
          ? operation(state, expression, expressions) : null;
       if (id === -5)
          return match(state, macro(state, expression, scope, depth), scope, depth + 1, mode | 4, target);
-      if (id === 8) {
-         arity(state, expression, 1, 2);
+      if (id === 11) {
+         arity(state, expression, 1, 1);
+         scope= target || scope;
+         castDate(state, read(state, scope.node, depth));
+         return true;
+      }
+      if (id >= 7 && id <= 10) {
+         arity(state, expression, 1, id === 7? Infinity : id === 8? 2 : id === 9? 3 : 1);
          scope= target || scope;
          value= read(state, scope.node, depth);
-         if (typeof value !== "string")
+         if (type(value) !== (id === 7? "array" : id === 8? "string" : id === 9? "number" : "boolean"))
             return false;
          if (expression.length === 1)
             return true;
+         if (id === 7)
+            return arrayMatch(state, expression, scope, depth, mode, value);
+         if (id === 9)
+            return numberMatch(state, expression, scope, depth, value);
          local= sequenceCursor(state, scope, value);
          i= 0;
          do {
@@ -1502,7 +1790,7 @@ function matchValue(state, expression, scope, depth, mode, target) {
       return false;
    if (kind !== "array" && kind !== "object") {
       charge(state, kind === "string"? (expression.length + value.length) * 0.001 : 1);
-      return kind === "date"? dateTime.call(expression) === dateTime.call(value) : expression === value;
+      return kind === "date"? dateEqual(state, expression, value, depth) : expression === value;
    }
    if (kind === "array") {
       local= sequenceCursor(state, scope, value);
@@ -1535,6 +1823,69 @@ function matchValue(state, expression, scope, depth, mode, target) {
    return true;
 }
 
+// CASTSTR numbers use JSON's fractional spelling but decimal integer digits.
+// Expand positive exponents without multiplying/rounding the stored number.
+function scalarString(state, value) {
+   var text, exponent, point;
+   charge(state, 1, 64);
+   text= integer(value) || !isFinite(value)? String(value) : JSON.stringify(value);
+   exponent= text.indexOf("e");
+   if (integer(value) && exponent !== -1) {
+      exponent= Number(stringSlice.call(text, exponent + 1));
+      text= stringSlice.call(text, 0, text.indexOf("e"));
+      point= text.indexOf(".");
+      if (point !== -1) {
+         exponent-= text.length - point - 1;
+         text= stringSlice.call(text, 0, point) + stringSlice.call(text, point + 1);
+      }
+      charge(state, exponent + text.length, exponent * 12 + text.length * 2 + 32, 1);
+      text+= new Array(exponent + 1).join("0");
+   }
+   return text;
+}
+
+// Cast a borrowed scalar without consulting user coercion methods. Date JSON
+// encoding receives a fresh native Date so input toJSON/valueOf are ignored.
+function cast(state, id, value, depth) {
+   var kind= type(value), text, year;
+   if (id === 68) {
+      if (kind === "boolean") return value;
+      if (kind === "string") charge(state, value.length * 0.001);
+      if (value === 0 || value === 1 || value === "true" || value === "false")
+         return value === 1 || value === "true";
+   } else if (id === 69) {
+      if (kind === "number") return value;
+      if (kind === "string") {
+         charge(state, value.length * 3);
+         if (regexpTest.call(jsonNumber, value)) {
+            text= Number(value);
+            if (!isFinite(text) || text === 0 && regexpTest.call(nonzeroMantissa, value))
+               fail(state, "UNSUPPORTED_GRAFT", "Number is outside the host numeric range");
+            return text;
+         }
+      }
+   } else {
+      if (kind === "string") return value;
+      if (kind === "boolean") return value? "true" : "false";
+      if (kind === "number") return scalarString(state, value);
+      if (value instanceof DateValue) return dateString(state, value);
+      if (kind === "date" && isFinite(dateTime.call(value))) {
+         charge(state, 1, 128);
+         year= dateYear.call(value);
+         text= stringSlice.call(JSON.stringify(copy(state, value, depth)), 1, -1);
+         // Old JSON/ISO encoders omit the sign and six-digit padding on years
+         // outside 0000..9999. Native Date years always fit six digits.
+         if (year < 0 || year > 9999) {
+            charge(state, 1, 64);
+            text= (year < 0? "-" : "+") + stringSlice.call("000000" + Math.abs(year), -6)
+               + stringSlice.call(text, text.indexOf("-", year < 0? 1 : 0));
+         }
+         return text;
+      }
+   }
+   fail(state, "INVALID_TARGET", "Cannot cast this value");
+}
+
 function evaluateValue(state, expression, scope, depth, borrowed) {
    var kind= type(expression), id, value, local, name, i, reference;
    location(state, scope);
@@ -1555,7 +1906,7 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       state.element= referenceElement(state, reference, depth);
       return value;
    }
-   if (id >= 1 && id <= 6 || id === 8 || id === 17 || id === 18)
+   if (id >= 1 && id <= 11 || id === 17 || id === 18)
       return match(state, expression, scope, depth);
    if (id === 50) {
       arity(state, expression, 2, 2);
@@ -1573,11 +1924,11 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       }
       return true;
    }
-   if (id === 55) {
+   if (id === 55 || id >= 68 && id <= 71) {
       arity(state, expression, 1, 2);
       value= expression.length === 1? read(state, scope.node, depth)
          : argument(state, expression, 1, scope, depth, borrow);
-      return lengthOf(state, value);
+      return id === 55? lengthOf(state, value) : id === 71? castDate(state, value) : cast(state, id, value, depth);
    }
    if (id === 57)
       return slice(state, expression, scope, depth);

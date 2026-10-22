@@ -67,10 +67,10 @@ SPLICE evaluates every replacement before changing its target. A resource
 failure while committing an edit can still leave a partially edited result.
 
 Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
-HAS, IS, NONE, ANY, ALL, EXISTS, NODE/TEMP/STASH/CONST/CAP references,
+HAS, IS, NONE, ANY, ALL, EXISTS, ARRAY, BOOL, NUM, NODE/TEMP/STASH/CONST/CAP references,
 EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CAPTURE,
-LOCAL, NOT, LENGTH,
-SLICE, CONCAT, and FAIL. SPLIT actions/expressions and JOIN support literal and
+LOCAL, NOT, LENGTH, SLICE, CONCAT, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
+SPLIT actions/expressions and JOIN support literal and
 regex separators, longest matches, keep modes, element constraints, trimming,
 and separator/trim metadata carried by array edits.
 Array and string sequences share the matcher, including ALL successor coverage,
@@ -79,8 +79,19 @@ classes and the remaining expressions are pending.
 Strings use Unicode codepoints: valid UTF-16 surrogate pairs form one
 character, while lone surrogates remain individual codepoints. LENGTH, SLICE,
 and SPLIT matching use these boundaries. This policy is fixed for this
-implementation. Native Dates can be copied; the specification's other date
-operations and virtual date properties are pending.
+implementation.
+
+DATE and CASTDATE accept calendar strings, numeric field objects, and native
+Dates. Parsed values retain their date/datetime/timestamp distinction, timezone
+offset, and leap seconds in internal namespaces. Their virtual calendar fields
+are read-only. Writing parsed values into the target exports canonical strings;
+native Date inputs remain native Dates, with virtual fields expressed in UTC.
+
+`config.truncateDateResolution` controls loss of fractional seconds. It defaults
+to `true` on hosts supporting milliseconds and `false` on seconds-only hosts.
+Truncation always rounds down, including before the Unix epoch. Set it to
+`false` to reject meaningful precision loss with `UNSUPPORTED_GRAFT`; redundant
+fractional zeroes are allowed. The instance reports the effective option.
 
 String indexing retains the original string and first tests for surrogate
 pairs. Strings without pairs use direct code-unit offsets. Other strings use
@@ -126,9 +137,9 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 1,149 COPY/MOVE/SPLICE/MATCH/IF/LENGTH/SLICE
-conformance cases and local implementation tests are active without TODO markers.
-The default adapter explicitly skips the ten cases with `needProto: true`
+`all` runs both in parallel. All 4,486 conformance cases across nineteen
+collections and local implementation tests are active without TODO markers.
+The default adapter explicitly skips the twenty-four cases with `needProto: true`
 when `forbidProto` is enabled. Names and descriptions do not affect skipping.
 Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
 restriction; host-restriction tests separately verify rejection on every engine.
