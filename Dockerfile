@@ -1,13 +1,24 @@
-# This Dockerfile creates an image with the old javascript engines needed
-# for testing this project.
+# This docker image contains everything needed for development and testing
+# of the library.  It includes a modern Node.js for running tools, an old
+# Node.js for testing compatibility, PhantomJS which is a headless browser
+# running an old version of Google's v8 engine, Terser for minifying the
+# library, perl for the 'prove' command, and Mojolicious for serving the test
+# directory to any browser you want to run manual tests with.
 
 FROM debian:13
 
 RUN apt-get update && apt-get install -y \
       ca-certificates fontconfig \
-      bzip2 curl gosu node-corepack jq unzip zip lsof procps \
-      git perl libmojolicious-perl \
+      bzip2 gzip unzip zip curl gosu jq lsof procps git \
+      nodejs node-corepack npm \
+      perl libmojolicious-perl \
  && rm -rf /var/lib/apt/lists/*
+
+# Pin the standalone CLI so size comparisons use the same minifier version.
+ENV TERSER_VERSION=5.44.0
+RUN npm install --global --no-audit --no-fund "terser@${TERSER_VERSION}" \
+    && npm cache clean --force \
+    && terser --version
 
 # Download PhantomJS 1.9.2
 ENV PHANTOM_VERSION=1.9.2
