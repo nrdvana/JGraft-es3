@@ -70,16 +70,15 @@ Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
 HAS, IS, NONE, ANY, ALL, EXISTS, NODE/TEMP/STASH/CONST/CAP references,
 EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CAPTURE,
 LOCAL, NOT, LENGTH,
-SLICE, CONCAT, and FAIL. There is supporting SPLIT action/expression and JOIN
-expression behavior for literal separators/trimming and ANY lists of literal
-alternatives, including separator/trim metadata carried by array edits.
+SLICE, CONCAT, and FAIL. SPLIT actions/expressions and JOIN support literal and
+regex separators, longest matches, keep modes, element constraints, trimming,
+and separator/trim metadata carried by array edits.
 Array and string sequences share the matcher, including ALL successor coverage,
-repetition, capture preferences, and MATCH/IF capture namespaces. The full SPLIT
-regex language, its `keep`/`element` options, character classes, and the remaining
-expressions are pending.
+repetition, capture preferences, and MATCH/IF capture namespaces. Character
+classes and the remaining expressions are pending.
 Strings use Unicode codepoints: valid UTF-16 surrogate pairs form one
 character, while lone surrogates remain individual codepoints. LENGTH, SLICE,
-and literal SPLIT use these boundaries. This policy is fixed for this
+and SPLIT matching use these boundaries. This policy is fixed for this
 implementation. Native Dates can be copied; the specification's other date
 operations and virtual date properties are pending.
 

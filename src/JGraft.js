@@ -1035,6 +1035,8 @@ function sequenceCursor(state, scope, value) {
    cursor.scope= scopeCopy(state, scope);
    cursor.scope.node= make(state);
    cursor.info= typeof value === "string"? stringInfo(state, value) : null;
+   cursor.start= 0;
+   cursor.length= null;
    cursor.value= cursor.info? make(state, true) : value;
    if (cursor.info)
       cursor.scope.regex= cursor;
@@ -1052,15 +1054,24 @@ function sequencePosition(state, cursor, position) {
    charge(state, 1);
    cursor.position= position;
    if (cursor.info) {
-      offset= stringOffset(state, cursor.info, position);
-      if (offset < cursor.info.text.length)
+      offset= stringOffset(state, cursor.info, cursor.start + position);
+      if (offset < cursor.info.text.length && (cursor.length === null || position < cursor.length))
          cursor.value[0]= character(cursor.info, offset);
       else if (owns(cursor.value, 0))
          delete cursor.value[0];
-      return offset >= cursor.info.text.length;
+      return offset >= cursor.info.text.length || cursor.length !== null && position >= cursor.length;
    }
    cursor.scope.node.keys[cursor.scope.node.keys.length - 1]= position;
    return position >= cursor.value.length;
+}
+
+// String views share the original index/checkpoints, but anchors, missing-node
+// probes, literals, and repetition must respect the view's logical boundaries.
+function sequenceLength(state, cursor, complete) {
+   if (!cursor.info) return cursor.value.length;
+   if (cursor.length !== null) return cursor.length;
+   if (complete && cursor.info.length === null) stringOffset(state, cursor.info, Infinity);
+   return cursor.info.length;
 }
 
 // Successors use -1 for the empty set, a number for a singleton, or an
@@ -1180,8 +1191,8 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
    charge(state, 1, 0, 0, depth);
    end= sequencePosition(state, cursor, position);
    scope= cursor.scope;
-   if (cursor.info? cursor.info.length !== null && position > cursor.info.length
-         : position > cursor.value.length)
+   offset= sequenceLength(state, cursor);
+   if (offset !== null && position > offset)
       return -1;
    if (!(mode & 2)) {
       id= kind === "array" && !(expression.length === 1 && type(get(expression, 0)) === "array")
@@ -1241,9 +1252,7 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
             fail(state, "INVALID_OPERAND", "Invalid repetition bounds");
          maximum= maximum === -1? Infinity : maximum || minimum;
          state.captures= null;
-         if (cursor.info && cursor.info.length === null)
-            stringOffset(state, cursor.info, Infinity);
-         end= cursor.info? cursor.info.length : cursor.value.length;
+         end= sequenceLength(state, cursor, true);
          result= minimum === 0? position : -1;
          frontier= position;
          count= 0;
@@ -1260,9 +1269,12 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
          }
          return result;
       }
-      if (id === 17 || id === 18) {
+      // A virtual string element exists exactly before the boundary; probing
+      // it needs no path walk or per-character diagnostic array.
+      if (id === 17 || id === 18 || cursor.info && id === 6) {
          arity(state, expression, 1, 1);
-         return (id === 17? position === 0 : end)? position : -1;
+         return id === 6? end? -1 : position + 1
+            : (id === 17? position === 0 : end)? position : -1;
       }
       // A one-argument comparison probes with the current sequence context but
       // consumes exactly one element. Alternate-target comparisons are assertions.
@@ -1285,7 +1297,7 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
    }
    if (cursor.info && (mode & 2 || id === null)) {
       if (kind === "string") {
-         offset= stringOffset(state, cursor.info, position);
+         offset= stringOffset(state, cursor.info, cursor.start + position);
          next= offset + expression.length;
          charge(state, expression.length + 1);
          if (stringSlice.call(cursor.info.text, offset, next) !== expression
@@ -1293,6 +1305,7 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
             return -1;
          info= stringInfo(state, expression);
          stringOffset(state, info, Infinity);
+         if (cursor.length !== null && position + info.length > cursor.length) return -1;
          return position + info.length;
       }
       return !end && kind === "number" && expression === cursor.value[0]? position + 1 : -1;
@@ -1572,7 +1585,7 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       return concat(state, expression, scope, depth);
    if (id === 62 || id === 63) {
       arity(state, expression, 2, 3);
-      local= splitConfig(state, get(expression, 1), scope, depth);
+      local= argument(state, expression, 1, scope, depth, splitConfig);
       value= expression.length === 2? read(state, scope.node, depth)
          : argument(state, expression, 2, scope, depth, borrow);
       return id === 62? splitString(state, value, local, depth) : joinArray(state, value, local);
@@ -1786,35 +1799,33 @@ function concat(state, expression, scope, depth) {
    return result;
 }
 
-// The SPLIT support needed by MOVE/SPLICE uses literal patterns and ANY lists
-// of literal alternatives. Matching is explicit and charged, without an opaque
-// host regex call that could perform unbounded backtracking.
+// Classify a pattern before evaluation: match roots retain regex syntax;
+// function/reference roots resolve once to literal strings in the caller scope.
+// Save the physical graft location for errors raised during deferred matching.
 function splitPattern(state, source, scope, depth) {
-   var result= make(state, true), child, i, j, id;
-   charge(state, 1, 0, 0, depth);
-   if (type(source) === "array") {
-      id= get(source, 0);
-      if (id === "ANY" || id === 4) {
-         charge(state, source.length);
-         for (i= 1; i < source.length; i++) {
-            child= splitPattern(state, get(source, i), scope, depth + 1);
-            charge(state, child.length, child.length * 8);
-            for (j= 0; j < child.length; j++)
-               result.push(child[j]);
-         }
-         return result;
-      }
-      source= evaluate(state, source, scope, depth + 1);
+   var result= make(state), expression= source, id= null;
+   while (type(expression) === "array") {
+      charge(state, 1, 0, 0, depth);
+      id= expression.length === 1 && type(get(expression, 0)) === "array"? null
+         : operation(state, expression, expressions);
+      if (id !== -5) break;
+      expression= macro(state, expression, scope, depth++);
    }
-   if (typeof source !== "string")
-      fail(state, "INVALID_OPERAND", "SPLIT requires string patterns");
-   result.push(source);
+   result.regex= id !== null && id >= 1 && id <= 18;
+   result.expression= result.regex? expression : borrow(state, source, scope, depth);
+   if (!result.regex && typeof result.expression !== "string")
+      fail(state, "INVALID_OPERAND", "SPLIT requires string or regex patterns");
+   result.depth= depth;
+   charge(state, state.graftPath.length, 32 + state.graftPath.length * 8, 1);
+   result.path= state.graftPath.slice(0);
+   result.length= result.regex? null : lengthOf(state, result.expression);
    return result;
 }
 
 function splitConfig(state, source, scope, depth) {
-   var result= make(state), names, key, i, raw;
-   if (type(source) !== "object") {
+   var result= make(state), names, key, i, raw, simple= type(source) !== "object";
+   result.scope= scope;
+   if (simple) {
       raw= make(state);
       raw.sep= source;
       source= raw;
@@ -1824,50 +1835,116 @@ function splitConfig(state, source, scope, depth) {
    for (i= 0; i < names.length; i++) {
       key= names[i];
       if (key !== "sep" && key !== "default" && key !== "trim" && key !== "ltrim"
-            && key !== "rtrim" && key !== "discard")
-         fail(state, "INVALID_OPERAND", "Unsupported SPLIT option: " + key);
+            && key !== "rtrim" && key !== "discard" && key !== "keep" && key !== "element")
+         fail(state, "INVALID_OPERAND", "Unknown SPLIT option: " + key);
    }
    if (owns(source, "trim") && (owns(source, "ltrim") || owns(source, "rtrim")))
       fail(state, "INVALID_OPERAND", "SPLIT trim conflicts with ltrim/rtrim");
-   raw= get(source, "sep");
-   result.variable= type(raw) === "array" && (get(raw, 0) === "ANY" || get(raw, 0) === 4);
-   result.pattern= splitPattern(state, raw, scope, depth + 1);
-   result.separator= owns(source, "default")? evaluate(state, get(source, "default"), scope, depth + 1)
-      : !result.variable? result.pattern[0] : undefined;
+   if (!owns(source, "sep"))
+      fail(state, "INVALID_OPERAND", "SPLIT requires a separator");
+   result.keep= get(source, "keep");
+   if (owns(source, "keep") && result.keep !== "<" && result.keep !== ">" && result.keep !== "@")
+      fail(state, "INVALID_OPERAND", "Invalid SPLIT keep mode");
+   result.pattern= simple? splitPattern(state, get(source, "sep"), scope, depth + 1)
+      : argument(state, source, "sep", scope, depth, splitPattern);
+   result.variable= result.pattern.regex && !result.keep;
+   if (result.variable && !owns(source, "default"))
+      fail(state, "INVALID_OPERAND", "A regex SPLIT separator requires a default");
+   result.separator= result.keep? "" : result.variable
+      ? argument(state, source, "default", scope, depth, borrow) : result.pattern.expression;
    if (typeof result.separator !== "string")
-      fail(state, "INVALID_OPERAND", "A variable SPLIT separator requires a string default");
-   raw= get(source, owns(source, "trim")? "trim" : "ltrim");
-   result.left= raw === undefined? null : splitPattern(state, raw, scope, depth + 1);
-   raw= get(source, owns(source, "trim")? "trim" : "rtrim");
-   result.right= raw === undefined? null : splitPattern(state, raw, scope, depth + 1);
+      fail(state, "INVALID_OPERAND", "A regex SPLIT separator requires a string default");
+   if (owns(source, "trim"))
+      result.left= result.right= argument(state, source, "trim", scope, depth, splitPattern);
+   else {
+      result.left= owns(source, "ltrim")? argument(state, source, "ltrim", scope, depth, splitPattern) : null;
+      result.right= owns(source, "rtrim")? argument(state, source, "rtrim", scope, depth, splitPattern) : null;
+   }
+   result.element= owns(source, "element")? argument(state, source, "element", scope, depth, splitPattern) : null;
    result.discard= get(source, "discard") === true;
    if (owns(source, "discard") && typeof get(source, "discard") !== "boolean")
       fail(state, "INVALID_OPERAND", "SPLIT discard must be boolean");
    return result;
 }
 
-function matchPattern(state, text, position, patterns, ending, minimum, paired) {
-   var best= -1, pattern, start, i;
-   if (!patterns)
-      return 0;
-   charge(state, patterns.length);
-   for (i= 0; i < patterns.length; i++) {
-      pattern= patterns[i];
-      start= ending? position - pattern.length : position;
-      charge(state, pattern.length + (paired? 4 : 0), pattern.length * 2);
-      if (start >= minimum && pattern.length > best
-            && stringBoundary(text, start, paired) && stringBoundary(text, start + pattern.length, paired)
-            && stringSlice.call(text, start, start + pattern.length) === pattern)
-         best= pattern.length;
+// Return the longest consumed length, or -1. Suffix matching scans starts in
+// ascending order and requires an endpoint at the view end. Literal patterns
+// avoid successor allocation and still enforce both Unicode/view boundaries.
+function matchPattern(state, pattern, cursor, position, ending) {
+   var length, start, offset, end, positions, i, count, best= -1;
+   var path= state.graftPath, captures= state.captures;
+   if (!pattern) return 0;
+   state.graftPath= pattern.path;
+   state.captures= null;
+   try {
+      length= sequenceLength(state, cursor, true);
+      if (!pattern.regex) {
+         start= ending? length - pattern.length : position;
+         if (start < position || start + pattern.length > length) return -1;
+         offset= stringOffset(state, cursor.info, cursor.start + start);
+         end= offset + pattern.expression.length;
+         charge(state, pattern.expression.length + 4, pattern.expression.length * 2);
+         return stringSlice.call(cursor.info.text, offset, end) === pattern.expression
+            && stringBoundary(cursor.info.text, end, !!cursor.info.checkpoints)? pattern.length : -1;
+      }
+      start= position;
+      do {
+         charge(state, 1);
+         positions= sequenceTerm(state, pattern.expression, cursor.scope, pattern.depth,
+            start * 32 + 16, cursor);
+         count= typeof positions === "number"? 1 : positions.length;
+         charge(state, count);
+         for (i= 0; i < count; i++) {
+            end= typeof positions === "number"? positions : positions[i];
+            if (end >= start && end <= length && (!ending || end === length))
+               best= Math.max(best, end - start);
+         }
+         if (best >= 0 || !ending) return best;
+      } while (start++ < length);
+      return -1;
+   } finally {
+      state.graftPath= path;
+      state.captures= captures;
    }
-   return best;
+}
+
+// A reusable view supplies anchored element/trim matching without creating an
+// index or scope for each substring. Metadata distinguishes a real empty
+// separator from the final remainder, which inherits its predecessor's separator.
+function splitAppend(state, result, split, view, start, end, separator, config) {
+   var left, right, offset, limit, item, text= view.info.text;
+   view.start= start;
+   view.length= end - start;
+   left= Math.max(0, matchPattern(state, config.left, view, 0, false));
+   view.start+= left;
+   view.length-= left;
+   right= Math.max(0, matchPattern(state, config.right, view, 0, true));
+   offset= stringOffset(state, view.info, start + left);
+   limit= stringOffset(state, view.info, end - right);
+   charge(state, end - start + 1, (limit - offset) * 2 + 8);
+   result.push(stringSlice.call(text, offset, limit));
+   if (split) {
+      item= make(state);
+      offset= stringOffset(state, view.info, start);
+      limit= stringOffset(state, view.info, end);
+      charge(state, 1, config.discard? 0 : (limit - offset) * 2);
+      item.left= config.discard? "" : stringSlice.call(text, offset, stringOffset(state, view.info, start + left));
+      item.right= config.discard? "" : stringSlice.call(text, stringOffset(state, view.info, end - right), limit);
+      item.sep= separator !== null? separator : split.items.length
+         ? split.items[split.items.length - 1].sep : config.separator;
+      charge(state, 1, 8);
+      split.items.push(item);
+   }
 }
 
 function splitString(state, text, config, depth) {
-   var result= make(state, true), info, characters, split, item, raw, left, right, sep, start= 0, position= 0, matched= -1;
+   var result= make(state, true), info, split, cursor, view, length, matched, sep, offset;
+   var start= 0, field= 0, position= 0;
    if (typeof text !== "string")
       fail(state, "INVALID_TARGET", "SPLIT requires a string");
-   characters= stringInfo(state, text);
+   cursor= sequenceCursor(state, config.scope, text);
+   view= sequenceCursor(state, config.scope, text);
+   length= sequenceLength(state, cursor, true);
    if (config.variable || !config.discard && (config.left || config.right)) {
       info= arrayInfo(state, result, true);
       split= info.split= make(state);
@@ -1875,55 +1952,43 @@ function splitString(state, text, config, depth) {
       split.origin.separator= config.separator;
       split.items= make(state, true);
    }
-   // Include the final remainder. Empty separator matches are skipped at the
-   // current boundary and do not add a synthetic trailing empty element.
-   while (position <= text.length) {
+   while (position <= length) {
       charge(state, 3, 0, 0, depth);
-      matched= matchPattern(state, text, position, config.pattern, false, 0, characters.checkpoints);
+      matched= matchPattern(state, config.pattern, cursor, position, false);
+      if (matched >= 0 && !(matched === 0 && position === start) && config.element) {
+         view.start= start;
+         view.length= position - start;
+         if (matchPattern(state, config.element, view, 0, false) !== view.length) matched= -1;
+      }
       if (matched < 0 || matched === 0 && position === start) {
-         if (position === text.length && start < text.length)
-            matched= 0;
-         else {
-            position+= position === text.length? 1 : character(characters, position, true);
+         if (position !== length) {
+            position++;
             continue;
          }
+         // Empty input has one empty field unless its separator matches empty.
+         if (start < length || !length && matched < 0)
+            splitAppend(state, result, split, view, field, length, null, config);
+         break;
       }
-      raw= stringSlice.call(text, start, position);
-      left= Math.max(0, matchPattern(state, raw, 0, config.left, false, 0, characters.checkpoints));
-      right= Math.max(0, matchPattern(state, raw, raw.length, config.right, true, left, characters.checkpoints));
-      charge(state, raw.length, raw.length * 2 + 8);
-      result.push(stringSlice.call(raw, left, raw.length - right));
-      sep= stringSlice.call(text, position, position + matched);
-      if (split) {
-         item= make(state);
-         item.left= config.discard? "" : stringSlice.call(raw, 0, left);
-         item.right= config.discard? "" : stringSlice.call(raw, raw.length - right);
-         item.sep= matched? sep : split.items.length? split.items[split.items.length - 1].sep : config.separator;
-         split.items.push(item);
-      }
+      offset= stringOffset(state, cursor.info, position);
+      charge(state, matched + 1, matched * 4);
+      sep= stringSlice.call(text, offset, stringOffset(state, cursor.info, position + matched));
+      // A zero-width end match only flushes the final field. Its metadata
+      // inherits the preceding separator, and keep must not add a new element.
+      splitAppend(state, result, split, view, field,
+         position + (config.keep === "<"? matched : 0), position === length? null : config.keep? "" : sep, config);
+      if (config.keep === "@" && position !== length)
+         splitAppend(state, result, split, view, position, position + matched, "", config);
+      field= config.keep === ">"? position : position + matched;
       start= position + matched;
-      if (position === text.length)
-         break;
-      position= matched? start : position + character(characters, position, true);
-      if (start === text.length && matched) {
-         // A nonempty final separator produces a trailing empty element.
-         result.push("");
-         if (split) {
-            item= make(state);
-            item.left= item.right= "";
-            item.sep= sep;
-            split.items.push(item);
-         }
+      if (position === length) break;
+      if (matched && start === length) {
+         splitAppend(state, result, split, view, field, length, null, config);
          break;
       }
+      position= matched? start : position + 1;
    }
-   if (!result.length && text === "" && config.pattern[0] !== "") {
-      result.push("");
-      if (split)
-         normalizeMetadata(state, split, 1);
-   }
-   if (info && !result.length)
-      info.split= null;
+   if (info && !result.length) info.split= null;
    return result;
 }
 
