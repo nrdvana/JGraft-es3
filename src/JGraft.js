@@ -27,7 +27,7 @@ var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
    HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11,
    SEQ: 13, SEQMAX: 14, SEQMIN: 15,
    REP: 16, START: 17, END: 18, CAPTURE: 50,
-   LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, FAIL: 67,
+   LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, MKOBJ: 65, FAIL: 67,
    CASTBOOL: 68, CASTNUM: 69, CASTSTR: 70, CASTDATE: 71};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
 // Checking an inherited sentinel also works when descriptors are unavailable.
@@ -1934,6 +1934,8 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       return slice(state, expression, scope, depth);
    if (id === 58)
       return concat(state, expression, scope, depth);
+   if (id === 65)
+      return makeObject(state, expression, scope, depth);
    if (id === 62 || id === 63) {
       arity(state, expression, 2, 3);
       local= argument(state, expression, 1, scope, depth, splitConfig);
@@ -2147,6 +2149,43 @@ function concat(state, expression, scope, depth) {
    }
    if (kind === "array")
       rebuild(state, result, make(state), entries);
+   return result;
+}
+
+// Materialize operands once in caller scope, then select alternating pairs,
+// parallel arrays, or a pair list by their evaluated shapes. All values are
+// independently owned; only string, unique own keys reach the safe writer.
+function makeObject(state, expression, scope, depth) {
+   var values= make(state, true), result= make(state), names, pairs, pair, name, value, count, i;
+   charge(state, expression.length, expression.length * 8);
+   for (i= 1; i < expression.length; i++)
+      values.push(argument(state, expression, i, scope, depth));
+   count= values.length;
+   if (count === 1 && type(values[0]) === "array") {
+      pairs= values[0];
+      count= pairs.length;
+   } else if (count === 2 && type(values[0]) === "array") {
+      names= values[0];
+      values= values[1];
+      if (type(values) !== "array" || names.length !== values.length)
+         fail(state, "INVALID_TARGET", "MKOBJ requires equally sized name and value arrays");
+      count= names.length;
+   } else {
+      if (!count || count % 2)
+         fail(state, "INVALID_TARGET", "MKOBJ requires name/value pairs");
+      count/= 2;
+   }
+   charge(state, count);
+   for (i= 0; i < count; i++) {
+      pair= pairs? get(pairs, i) : null;
+      if (pairs && (type(pair) !== "array" || pair.length !== 2))
+         fail(state, "INVALID_TARGET", "MKOBJ property entries must be two-element arrays");
+      name= pairs? get(pair, 0) : get(names || values, names? i : i * 2);
+      value= pairs? get(pair, 1) : get(values, names? i : i * 2 + 1);
+      if (typeof name !== "string" || owns(result, name))
+         fail(state, "INVALID_TARGET", "MKOBJ requires unique string property names");
+      put(state, result, name, value);
+   }
    return result;
 }
 

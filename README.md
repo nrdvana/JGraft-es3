@@ -69,7 +69,7 @@ failure while committing an edit can still leave a partially edited result.
 Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
 HAS, IS, NONE, ANY, ALL, EXISTS, ARRAY, BOOL, NUM, NODE/TEMP/STASH/CONST/CAP references,
 EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CAPTURE,
-LOCAL, NOT, LENGTH, SLICE, CONCAT, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
+LOCAL, NOT, LENGTH, SLICE, CONCAT, MKOBJ, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
 SPLIT actions/expressions and JOIN support literal and
 regex separators, longest matches, keep modes, element constraints, trimming,
 and separator/trim metadata carried by array edits.
@@ -137,9 +137,9 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 4,486 conformance cases across nineteen
+`all` runs both in parallel. All 4,791 conformance cases across twenty-one
 collections and local implementation tests are active without TODO markers.
-The default adapter explicitly skips the twenty-four cases with `needProto: true`
+The default adapter explicitly skips the thirty cases with `needProto: true`
 when `forbidProto` is enabled. Names and descriptions do not affect skipping.
 Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
 restriction; host-restriction tests separately verify rejection on every engine.
