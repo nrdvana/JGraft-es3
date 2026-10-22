@@ -24,7 +24,7 @@ var nonzeroMantissa= /^[^eE]*[1-9]/;
 var defaults= {mem: 67108864, ops: 1000000, new_obj: 100000, depth: 128};
 var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6};
 var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
-   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11,
+   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11, WITH: 12,
    SEQ: 13, SEQMAX: 14, SEQMIN: 15,
    REP: 16, START: 17, END: 18, CAPTURE: 50,
    LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, MKOBJ: 65, FAIL: 67,
@@ -1116,6 +1116,30 @@ function valueScope(state, scope, value) {
    return result;
 }
 
+// LOCAL evaluates binding names and can rebind NODE with null. WITH accepts
+// only literal string/integer TEMP names. Both assign sequentially into a
+// private shallow TEMP root, leaving caller holders and nested data untouched.
+function bindingScope(state, expression, scope, depth, local) {
+   var result, name, value, i;
+   if (expression.length < (local? 2 : 4) || expression.length % 2)
+      fail(state, "INVALID_GRAFT", "Expected binding pairs and a final expression");
+   result= scopeCopy(state, scope);
+   result.temp= holder(state, copy(state, scope.temp.value, depth, true), true);
+   charge(state, expression.length);
+   for (i= 1; i < expression.length - 1; i+= 2) {
+      name= local? argument(state, expression, i, result, depth) : get(expression, i);
+      if (!(local && name === null) && typeof name !== "string"
+            && !(local? typeof name === "number" : integer(name)))
+         fail(state, local? "INVALID_OPERAND" : "INVALID_GRAFT", "Invalid lexical binding name");
+      value= argument(state, expression, i + 1, result, depth);
+      if (name === null)
+         result= valueScope(state, result, value);
+      else
+         put(state, result.temp.value, String(name), value);
+   }
+   return result;
+}
+
 // Probe errors mean false; syntax/resource errors and application exceptions
 // escape. Discard diagnostic path segments left by a failed argument walk so
 // another alternative or a later action gets its own correct location.
@@ -1438,6 +1462,16 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
       if (id === -5)
          return sequenceTerm(state, macro(state, expression, scope, depth), scope, depth + 1,
             position * 32 + (mode | 4) + (options & 16), cursor);
+      if (id === 12) {
+         next= bindingScope(state, expression, scope, depth, false);
+         cursor.scope= next;
+         try {
+            return argument(state, expression, expression.length - 1, next, depth, sequenceTerm,
+               position * 32 + (mode & 1) + (options & 16), cursor);
+         } finally {
+            cursor.scope= scope;
+         }
+      }
       if (id >= 13 && id <= 15) {
          arity(state, expression, id === 13? 1 : 2, Infinity);
          if (id !== 13 && options & 16)
@@ -1525,7 +1559,7 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
          }
          return sequenceElement(state, expression, scope, depth, mode, cursor, position, 0);
       }
-      if (cursor.info && (id === null || id < 1 || id > 18 || mode & 4 && (id < 6 || id > 11))) {
+      if (cursor.info && (id === null || id < 1 || id > 18 || mode & 4 && (id < 6 || id > 12))) {
          if (id !== null || mode & 4) {
             expression= borrow(state, expression, scope, depth + 1);
             kind= type(expression);
@@ -1714,6 +1748,10 @@ function matchValue(state, expression, scope, depth, mode, target) {
          ? operation(state, expression, expressions) : null;
       if (id === -5)
          return match(state, macro(state, expression, scope, depth), scope, depth + 1, mode | 4, target);
+      if (id === 12) {
+         local= bindingScope(state, expression, target || scope, depth, false);
+         return argument(state, expression, expression.length - 1, local, depth, match, mode & 1);
+      }
       if (id === 11) {
          arity(state, expression, 1, 1);
          scope= target || scope;
@@ -1887,7 +1925,7 @@ function cast(state, id, value, depth) {
 }
 
 function evaluateValue(state, expression, scope, depth, borrowed) {
-   var kind= type(expression), id, value, local, name, i, reference;
+   var kind= type(expression), id, value, local, i, reference;
    location(state, scope);
    charge(state, 1, 0, 0, depth);
    if (kind === "object")
@@ -1906,7 +1944,7 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       state.element= referenceElement(state, reference, depth);
       return value;
    }
-   if (id >= 1 && id <= 11 || id === 17 || id === 18)
+   if (id >= 1 && id <= 12 || id === 17 || id === 18)
       return match(state, expression, scope, depth);
    if (id === 50) {
       arity(state, expression, 2, 2);
@@ -1948,22 +1986,7 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       fail(state, "INVALID_TARGET", "Explicit FAIL expression");
    }
    if (id === 51) {
-      if (expression.length < 2 || expression.length % 2 !== 0)
-         fail(state, "INVALID_GRAFT", "LOCAL requires pairs and a result expression");
-      // Only binding roots change; nested values remain read-only expressions.
-      local= scopeCopy(state, scope);
-      local.temp= holder(state, copy(state, scope.temp.value, depth, true), true);
-      charge(state, expression.length);
-      for (i= 1; i < expression.length - 1; i+= 2) {
-         name= argument(state, expression, i, local, depth);
-         value= argument(state, expression, i + 1, local, depth);
-         if (name === null)
-            local= valueScope(state, local, value);
-         else if (typeof name === "string" || typeof name === "number")
-            put(state, local.temp.value, String(name), value);
-         else
-            fail(state, "INVALID_OPERAND", "Invalid LOCAL binding name");
-      }
+      local= bindingScope(state, expression, scope, depth, true);
       return argument(state, expression, expression.length - 1, local, depth);
    }
    fail(state, "INVALID_GRAFT", "Unsupported value expression");

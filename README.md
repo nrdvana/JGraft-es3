@@ -69,13 +69,19 @@ failure while committing an edit can still leave a partially edited result.
 Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
 HAS, IS, NONE, ANY, ALL, EXISTS, ARRAY, BOOL, NUM, NODE/TEMP/STASH/CONST/CAP references,
 EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CAPTURE,
-LOCAL, NOT, LENGTH, SLICE, CONCAT, MKOBJ, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
+LOCAL, WITH, NOT, LENGTH, SLICE, CONCAT, MKOBJ, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
 SPLIT actions/expressions and JOIN support literal and
 regex separators, longest matches, keep modes, element constraints, trimming,
 and separator/trim metadata carried by array edits.
 Array and string sequences share the matcher, including ALL successor coverage,
 repetition, capture preferences, and MATCH/IF capture namespaces. Character
 classes and the remaining expressions are pending.
+
+LOCAL supports sequential TEMP bindings and temporary NODE overrides, returning
+its final expression as a value. WITH accepts literal string/integer TEMP names
+and preserves its final expression's matching, sequence, and regex behavior.
+Both restore the caller's bindings when their scope ends.
+
 Strings use Unicode codepoints: valid UTF-16 surrogate pairs form one
 character, while lone surrogates remain individual codepoints. LENGTH, SLICE,
 and SPLIT matching use these boundaries. This policy is fixed for this
@@ -137,9 +143,9 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 4,791 conformance cases across twenty-one
+`all` runs both in parallel. All 5,044 conformance cases across twenty-three
 collections and local implementation tests are active without TODO markers.
-The default adapter explicitly skips the thirty cases with `needProto: true`
+The default adapter explicitly skips the thirty-two cases with `needProto: true`
 when `forbidProto` is enabled. Names and descriptions do not affect skipping.
 Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
 restriction; host-restriction tests separately verify rejection on every engine.
