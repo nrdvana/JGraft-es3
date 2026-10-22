@@ -126,14 +126,16 @@ JS
 
       my $container= <<'JS';
 TAP(function(t) {
-   TestJGraft.runConformanceTests(t,{version:1,name:'fixture suite',tests:[
-      {name:'drop',input:0,jgraft:[],output:0},
-      {name:'wanted',input:1,jgraft:[],output:1}
+   TestJGraft.runConformanceTests(t,{version:1,name:'fixture suite',desc:'collection purpose',tests:[
+      {name:'selection',desc:'selection purpose',tests:[
+         {name:'drop',desc:'drop purpose',input:0,jgraft:[],output:0},
+         {name:'wanted',input:1,jgraft:[],output:1}
+      ]}
    ]},function(input) {if (!input) throw new Error('unselected fixture ran');return input;});
    t.done_testing();
 });
 JS
-      ($status, $output)= run_fixture($engine, 'case filter', $container, '', 1000, '^fixture suite / wanted$');
+      ($status, $output)= run_fixture($engine, 'case filter', $container, '', 1000, '^fixture suite / selection / wanted$');
       is($status, 0, 'selects a conformance case through its suite container');
       like($output, qr/ok 2 - Subtest: wanted/, 'case index is unchanged');
       unlike($output, qr/unselected fixture ran/, 'unselected conformance graft is not applied');
@@ -143,6 +145,12 @@ JS
       my $summary_parser= TAP::Parser->new({tap => $output});
       1 while $summary_parser->next;
       ok(!$summary_parser->has_problems, 'summary notes preserve valid TAP and passing status');
+      unlike($output, qr/# (?:collection|selection|drop) purpose/, 'passing filtered groups omit descriptions');
+      ($status, $output)= run_fixture($engine, 'nested failure descriptions', $container);
+      isnt($status, 0, 'a nested failed case fails the engine run');
+      like($output, qr/# drop purpose/, 'failed case explains its purpose');
+      like($output, qr/# selection purpose/, 'failed group explains its purpose');
+      like($output, qr/^    # collection purpose$/m, 'failed collection explains its purpose');
 
       ($status, $output)= run_fixture($engine, 'invalid subtest filter', $filtered, '', 1000, '[');
       isnt($status, 0, 'invalid regexes fail before running tests');

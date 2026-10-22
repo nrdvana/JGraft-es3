@@ -189,6 +189,7 @@ TestJGraft.noteError= function(t, error, context) {
 
 function runCase(t, test, apply, forbidProto) {
    t.subtest(test.name, function(t) {
+      t._jgraftDescription= test.desc;
       var before, output, error, caught= false, code, allowed= test.errors || {};
       var mustLimit= owns(allowed, "RESOURCE_LIMIT") && allowed.RESOURCE_LIMIT === true;
       if (!owns(test, "input") || !owns(test, "jgraft") || (!owns(test, "output") && !owns(test, "errors"))) {
@@ -224,6 +225,8 @@ function runCase(t, test, apply, forbidProto) {
          t.noteDifferences(test.output, output);
       }
    });
+   // Filtered callbacks never execute, but their leaf still counts as a skip.
+   t.results[t.results.length - 1]._jgraftCase= true;
 }
 
 // Provisional adapter: this is the only place tied to the implementation API.
@@ -238,6 +241,11 @@ function installConformanceSummary() {
    if (original._jgraftSummary) return;
    function done(count) {
       original.call(this, count);
+      if (!this.actual_success && !this._jgraftDescriptionPrinted
+            && typeof this._jgraftDescription === "string") {
+         this._jgraftDescriptionPrinted= true;
+         note(this, this._jgraftDescription);
+      }
       if (!this.subtest_level && !this._jgraftSummaryPrinted) {
          this._jgraftSummaryPrinted= true;
          conformanceSummary(this);
@@ -255,24 +263,32 @@ function conformanceSummary(root) {
          + counts[4] + ' TODO failed, ' + counts[5] + ' TODO passed (unexpected), '
          + counts[6] + ' not run');
    }
-   function visit(test, todo) {
-      var counts, i, j, child, category;
+   function collect(test, todo, counts) {
+      var i, category, before= counts[0];
       todo= todo || test.todo_reason !== undefined || test._todo !== undefined;
-      if (test._jgraftCaseCount !== undefined) {
-         suites++;
-         counts= [test._jgraftCaseCount, 0, 0, 0, 0, 0, 0];
-         // A missing implementation skips the entire suite without creating cases.
-         if (test.skipped && !test.results.length)
-            counts[3]= counts[0];
-         else for (i= 0; i < test.results.length; i++) {
-            child= test.results[i];
-            category= child.skipped? 3
-               : todo || child.todo_reason !== undefined || (child.success && !child.actual_success)
-               ? child.actual_success? 5 : 4
-               : child.success? 1 : 2;
-            counts[category]++;
+      if (test._jgraftCase || test.skipped && !test.results.length) {
+         category= test.skipped? 3
+            : todo || (test.success && !test.actual_success)
+            ? test.actual_success? 5 : 4 : test.success? 1 : 2;
+         i= test._jgraftCase? 1 : test._jgraftCaseCount || 0;
+         counts[0]+= i;
+         counts[category]+= i;
+      } else {
+         for (i= 0; i < test.results.length; i++) collect(test.results[i], todo, counts);
+         if (test._jgraftCaseCount !== undefined) {
+            i= test._jgraftCaseCount - (counts[0] - before);
+            counts[0]+= i;
+            counts[6]+= i;
          }
-         if (!test.skipped) counts[6]= counts[0] - test.results.length;
+      }
+   }
+   function visit(test, todo) {
+      var counts, i, j;
+      todo= todo || test.todo_reason !== undefined || test._todo !== undefined;
+      if (test._jgraftSuite) {
+         suites++;
+         counts= [0, 0, 0, 0, 0, 0, 0];
+         collect(test, todo, counts);
          for (j= 0; j < counts.length; j++) total[j]+= counts[j];
          report('Conformance ' + global.TAP.format(test.subtestPath.join(' / ')), counts);
       } else if (test.results) {
@@ -283,14 +299,45 @@ function conformanceSummary(root) {
    if (suites) report('Conformance total', total);
 }
 
+// Groups carry documentation and structure only; execution settings remain
+// explicit on each leaf. Count leaves before execution, including skipped work.
+function countCases(test, collection) {
+   var i, count= 0, key;
+   if (!test || typeof test.name !== "string" || !test.name
+         || owns(test, "desc") && typeof test.desc !== "string")
+      throw new Error("Expected a named case or group with an optional string desc");
+   if (!owns(test, "tests")) return 1;
+   if (tag(test.tests) !== "[object Array]" || !test.tests.length)
+      throw new Error("Expected a nonempty tests array in group: " + test.name);
+   for (key in test)
+      if (owns(test, key) && key !== "name" && key !== "desc" && key !== "tests"
+            && !(collection && key === "version"))
+         throw new Error("Unexpected group property: " + key);
+   for (i= 0; i < test.tests.length; i++) count+= countCases(test.tests[i], false);
+   return count;
+}
+
+function runGroup(t, group, apply, forbidProto, count) {
+   t.subtest(group.name, function(t) {
+      var i;
+      t._jgraftDescription= group.desc;
+      t._jgraftCaseCount= count;
+      for (i= 0; i < group.tests.length; i++)
+         if (owns(group.tests[i], "tests"))
+            runGroup(t, group.tests[i], apply, forbidProto, countCases(group.tests[i], false));
+         else runCase(t, group.tests[i], apply, forbidProto);
+   }, {container: true});
+}
+
 function runConformanceTests(t, source, apply) {
-   var suite, i, forbidProto;
+   var suite, i, forbidProto, count;
    installConformanceSummary();
    try {
       suite= typeof source === "string"? JSON.parse(TestJGraft.readFile(source)) : source;
       if (!suite || suite.version !== 1 || typeof suite.name !== "string"
             || tag(suite.tests) !== "[object Array]" || !suite.tests.length)
          throw new Error("Expected a version 1 conformance suite with a name and nonempty tests array");
+      count= countCases(suite, true);
    } catch (error) {
       t.subtest(typeof source === "string"? source : "Invalid suite", function(t) {
          t.fail("Cannot load conformance suite");
@@ -299,14 +346,18 @@ function runConformanceTests(t, source, apply) {
       return;
    }
    t.subtest(suite.name, function(t) {
-      t._jgraftCaseCount= suite.tests.length;
+      t._jgraftSuite= true;
+      t._jgraftDescription= suite.desc;
+      t._jgraftCaseCount= count;
       if (!apply && (typeof global.JGraft !== "function" || typeof global.JGraft.prototype.apply !== "function")) {
          t.plan(0, "JGraft.prototype.apply is not implemented");
          return;
       }
       forbidProto= !apply && new global.JGraft(["JGRAFT", {v: 1}]).forbidProto;
       for (i= 0; i < suite.tests.length; i++)
-         runCase(t, suite.tests[i], apply || applyGraft, forbidProto);
+         if (owns(suite.tests[i], "tests"))
+            runGroup(t, suite.tests[i], apply || applyGraft, forbidProto, countCases(suite.tests[i], false));
+         else runCase(t, suite.tests[i], apply || applyGraft, forbidProto);
    }, {container: true});
 }
 

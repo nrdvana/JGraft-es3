@@ -126,6 +126,12 @@ TAP(function(t) {
    });
 
    t.subtest('file loading and complete iteration', function(t) {
+      function leafCount(node, results) {
+         var children= results? node.results : node.tests, count= 0, i;
+         if (results? node._jgraftCase : !children) return 1;
+         for (i= 0; i < children.length; i++) count+= leafCount(children[i], results);
+         return count;
+      }
       var paths= [
          '../jgraft-spec/conformance/01-copy.json',
          '../jgraft-spec/conformance/02-move.json',
@@ -134,11 +140,95 @@ TAP(function(t) {
       for (var i= 0; i < paths.length; i++) {
          var suite= JSON.parse(TestJGraft.readFile(paths[i]));
          var result= capture(paths[i], function() { throw 'INVALID_TARGET'; });
-         t.is(result.results.length, suite.tests.length, suite.name + ': every case runs despite failures');
+         t.is(leafCount(result,true), leafCount(suite,false), suite.name + ': every leaf case runs despite failures');
       }
       t.ok(!capture('missing-conformance.json', function() {}).success, 'missing files fail instead of being skipped');
       t.ok(!capture({version: 1, name: 'Empty', tests: []}, function() {}).success, 'empty suites fail');
       t.ok(!capture({version: 99, name: 'Future', tests: [{}]}, function() {}).success, 'unsupported fixture versions fail');
+   });
+
+   t.subtest('nested conformance groups and failure descriptions', function(t) {
+      var bad= fixture(1,9), good= fixture(0,0), permitted= fixture(-1);
+      bad.name= 'bad';bad.desc= 'Case purpose\nnot ok 999 - description text';
+      good.name= 'good';good.desc= 'Passing case purpose';
+      permitted.name= 'allowed error';permitted.errors= {INVALID_TARGET:true};
+      permitted.desc= 'Permitted error purpose';
+      var suite= {version:1,name:'Nested suite',desc:'Collection purpose',tests:[
+         {name:'outer',desc:'Outer purpose',tests:[
+            {name:'inner',desc:'Inner purpose',tests:[good,bad]}
+         ]},
+         {name:'passing',desc:'Passing group purpose',tests:[permitted]},
+         fixture(2,2)
+      ]};
+      function run(pattern, todo) {
+         var root= new TAP(), emit= TAP.prototype.emit, lines= [], calls= [];
+         TAP.prototype.emit= function(line) {lines.push(this.prefix+line);};
+         try {
+            if (pattern) root.filterSubtests(pattern);
+            function execute(t) {
+               TestJGraft.runConformanceTests(t,suite,function(input) {
+                  calls.push(input);
+                  if (input === -1) throw {code:'INVALID_TARGET'};
+                  return input;
+               });
+            }
+            if (todo) root.todo('pending',execute);else execute(root);
+            root.done_testing();
+         } finally {TAP.prototype.emit= emit;}
+         return {root:root,text:lines.join('\n'),calls:calls};
+      }
+      var result= run();
+      t.ok(!result.root.success,'a nested failure fails the collection');
+      t.is(result.calls,[0,1,-1,2],'all leaf cases run, including later siblings');
+      t.ok(/# Case purpose\n\s*# not ok 999 - description text/.test(result.text),'multiline case descriptions remain TAP notes');
+      t.ok(!/^not ok 999/m.test(result.text),'descriptions cannot inject assertions');
+      t.ok(/# Inner purpose/.test(result.text) && /# Outer purpose/.test(result.text)
+         && /# Collection purpose/.test(result.text),'every failing ancestor reports its description');
+      t.ok(!/# Passing case purpose|# Passing group purpose|# Permitted error purpose/.test(result.text),
+         'passing cases and groups, including permitted errors, omit descriptions');
+      t.ok(/Conformance total: 4 cases; 3 passed, 1 failed, 0 skipped/.test(result.text),'totals count leaves rather than groups');
+      result= run('^Nested suite / outer / inner / good$');
+      t.is(result.calls,[0],'full paths select cases through multiple container groups');
+      t.ok(result.root.success && /Conformance total: 4 cases; 1 passed, 0 failed, 3 skipped/.test(result.text),'nested filtered leaves count as skips');
+      t.ok(!/# Collection purpose|# Inner purpose|# Case purpose/.test(result.text),'filtered failures emit no descriptions');
+      result= run('^inner$');
+      t.is(result.calls,[0,1],'selecting a group executes its complete subtree');
+      result= run('^nothing matches$');
+      t.ok(result.root.success && /Conformance total: 4 cases; 0 passed, 0 failed, 4 skipped/.test(result.text),'unmatched nested collections report every leaf skipped');
+      result= run(null,true);
+      t.ok(result.root.success && !result.root.actual_success,'nested TODO failures preserve effective passing status');
+      t.ok(/# Case purpose/.test(result.text) && /# Collection purpose/.test(result.text),'TODO failures also report their descriptions');
+      t.ok(/Conformance total: 4 cases; 0 passed, 0 failed, 0 skipped, 1 TODO failed, 3 TODO passed/.test(result.text),
+         'TODO totals count each nested leaf exactly once');
+      var input= {};
+      Object.defineProperty(input,'x',{enumerable:true,get:function(){throw new Error('snapshot failure');}});
+      suite= {version:1,name:'Throwing suite',desc:'Throwing collection purpose',tests:[
+         {name:'throwing group',desc:'Throwing group purpose',tests:[
+            {name:'throwing case',desc:'Throwing case purpose',input:input,jgraft:[],output:0},
+            good
+         ]}
+      ]};
+      result= run();
+      t.ok(/# Throwing case purpose/.test(result.text) && /# Throwing group purpose/.test(result.text)
+         && /# Throwing collection purpose/.test(result.text),'unexpected callback exceptions also report case and ancestor descriptions');
+      t.ok(/Conformance total: 2 cases; 1 passed, 1 failed/.test(result.text),'a callback exception counts as one failed leaf and does not stop siblings');
+   });
+
+   t.subtest('conformance group validation', function(t) {
+      var invalid= [
+         {name:'empty',tests:[]},
+         {name:'wrong children',tests:{}},
+         {name:'inherited limits',limits:{ops:10},tests:[fixture(0,0)]},
+         {name:'mixed case and group',input:0,tests:[fixture(0,0)]},
+         {name:'bad description',desc:1,tests:[fixture(0,0)]},
+         {tests:[fixture(0,0)]}
+      ], i;
+      for (i= 0; i < invalid.length; i++)
+         t.ok(!capture({version:1,name:'Invalid group',tests:[invalid[i]]},function(input){return input;}).success,
+            'rejects invalid group '+i);
+      t.ok(capture({version:1,name:'Optional descriptions',tests:[
+         {name:'group',tests:[fixture(0,0)]}
+      ]},function(input){return input;}).success,'group descriptions are optional');
    });
 
    t.subtest('default adapter and pending implementation', function(t) {
