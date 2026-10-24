@@ -69,7 +69,7 @@ failure while committing an edit can still leave a partially edited result.
 Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
 HAS, IS, NONE, ANY, ALL, EXISTS, ARRAY, BOOL, NUM, NODE/TEMP/STASH/CONST/CAP references,
 EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CAPTURE,
-LOCAL, WITH, NOT, LENGTH, SLICE, CONCAT, MKOBJ, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
+LOCAL, WITH, NOT, LENGTH, SLICE, CONCAT, MKOBJ, CASE, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
 SPLIT actions/expressions and JOIN support literal and
 regex separators, longest matches, keep modes, element constraints, trimming,
 and separator/trim metadata carried by array edits.
@@ -81,6 +81,12 @@ LOCAL supports sequential TEMP bindings and temporary NODE overrides, returning
 its final expression as a value. WITH accepts literal string/integer TEMP names
 and preserves its final expression's matching, sequence, and regex behavior.
 Both restore the caller's bindings when their scope ends.
+
+CASE tests conditions in match context and evaluates only the first selected
+result, or its else value. Without a matching condition or an explicit else,
+it raises `INVALID_TARGET`, like FAIL. FAIL in a condition becomes a non-match;
+FAIL in a selected result propagates. LOCAL can rebind NODE to a discriminator
+so CASE conditions use direct patterns.
 
 Strings use Unicode codepoints: valid UTF-16 surrogate pairs form one
 character, while lone surrogates remain individual codepoints. LENGTH, SLICE,
@@ -143,9 +149,9 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 5,044 conformance cases across twenty-three
+`all` runs both in parallel. All 5,240 conformance cases across twenty-five
 collections and local implementation tests are active without TODO markers.
-The default adapter explicitly skips the thirty-two cases with `needProto: true`
+The default adapter explicitly skips the thirty-three cases with `needProto: true`
 when `forbidProto` is enabled. Names and descriptions do not affect skipping.
 Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
 restriction; host-restriction tests separately verify rejection on every engine.

@@ -27,7 +27,7 @@ var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
    HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11, WITH: 12,
    SEQ: 13, SEQMAX: 14, SEQMIN: 15,
    REP: 16, START: 17, END: 18, CAPTURE: 50,
-   LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, MKOBJ: 65, FAIL: 67,
+   LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, MKOBJ: 65, CASE: 66, FAIL: 67,
    CASTBOOL: 68, CASTNUM: 69, CASTSTR: 70, CASTDATE: 71};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
 // Checking an inherited sentinel also works when descriptors are unavailable.
@@ -1981,9 +1981,19 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
          : argument(state, expression, 2, scope, depth, borrow);
       return id === 62? splitString(state, value, local, depth) : joinArray(state, value, local);
    }
-   if (id === 67) {
-      arity(state, expression, 1, 1);
-      fail(state, "INVALID_TARGET", "Explicit FAIL expression");
+   if (id === 66 || id === 67) {
+      arity(state, expression, id === 66? 3 : 1, id === 66? Infinity : 1);
+      if (id === 66) {
+         // Conditions use match context; only one result is constructed.
+         // A selected result's failure propagates rather than trying a fallback.
+         charge(state, expression.length);
+         for (i= 1; i < expression.length - 1; i+= 2)
+            if (argument(state, expression, i, scope, depth, match))
+               return argument(state, expression, i + 1, scope, depth);
+         if (!(expression.length % 2))
+            return argument(state, expression, expression.length - 1, scope, depth);
+      }
+      fail(state, "INVALID_TARGET", id === 66? "No CASE condition matched" : "Explicit FAIL expression");
    }
    if (id === 51) {
       local= bindingScope(state, expression, scope, depth, true);
