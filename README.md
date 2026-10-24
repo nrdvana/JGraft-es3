@@ -54,8 +54,9 @@ namespaces describe the location in that namespace. Invalid resource
 configuration throws a `TypeError` during construction.
 
 `UNSUPPORTED_GRAFT` reports a valid positive integer version newer than this
-implementation supports, or a property operation forbidden by the host
-configuration. It always terminates the graft, including inside MATCH, IF,
+implementation supports, numeric range or configured date-resolution loss,
+or a property operation forbidden by the host configuration.
+It always terminates the graft, including inside MATCH, IF,
 and logical matching expressions. Malformed version declarations remain
 `INVALID_GRAFT`.
 
@@ -68,14 +69,18 @@ failure while committing an edit can still leave a partially edited result.
 
 Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
 HAS, IS, NONE, ANY, ALL, EXISTS, ARRAY, BOOL, NUM, NODE/TEMP/STASH/CONST/CAP references,
-EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CAPTURE,
-LOCAL, WITH, NOT, LENGTH, SLICE, CONCAT, MKOBJ, CASE, FAIL, CASTBOOL, CASTNUM, CASTSTR, DATE, and CASTDATE.
+EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CHARS, CAPTURE,
+LOCAL, WITH, NOT, LENGTH, CURPROP, SLICE, CONCAT, REDUCE, FILTER, MAP,
+MKOBJ, CASE, FAIL, CASTBOOL, CASTNUM,
+CASTSTR, DATE, CASTDATE, LESS, LESSEQ, ADD, SUB, MUL, DIV, and MOD.
 SPLIT actions/expressions and JOIN support literal and
 regex separators, longest matches, keep modes, element constraints, trimming,
 and separator/trim metadata carried by array edits.
 Array and string sequences share the matcher, including ALL successor coverage,
-repetition, capture preferences, and MATCH/IF capture namespaces. Character
-classes and the remaining expressions are pending.
+repetition, capture preferences, and MATCH/IF capture namespaces. CHARS supports
+Unicode character lists, inclusive ranges, inclusion/exclusion, and common
+CHARS expressions. Outside regex context it accepts integer codepoints and
+one-codepoint strings. Remaining expressions are pending.
 
 LOCAL supports sequential TEMP bindings and temporary NODE overrides, returning
 its final expression as a value. WITH accepts literal string/integer TEMP names
@@ -87,6 +92,23 @@ result, or its else value. Without a matching condition or an explicit else,
 it raises `INVALID_TARGET`, like FAIL. FAIL in a condition becomes a non-match;
 FAIL in a selected result propagates. LOCAL can rebind NODE to a discriminator
 so CASE conditions use direct patterns.
+
+LESS and LESSEQ compare booleans, numbers, Unicode codepoint strings,
+lexicographic arrays, and dates of the same precision. Mismatched types and
+unsupported values encountered during comparison raise `INVALID_TARGET`.
+
+ADD and MUL accept individual numbers or one numeric array, returning 0 and 1
+respectively for empty input. SUB, DIV, and MOD require two numbers. MOD follows
+the divisor's sign. Zero divisors and NaN results raise `INVALID_TARGET`;
+overflow raises `UNSUPPORTED_GRAFT`. Rounding and underflow follow native
+JavaScript arithmetic.
+
+CURPROP returns the current property name or index, including virtual
+positions, and null at a root. REDUCE, FILTER, and MAP localize NODE to each
+array element while preserving its index. REDUCE uses a literal string/number
+TEMP name for its accumulator; FILTER evaluates a match predicate, and MAP
+evaluates one value per element. Their lexical changes are scoped to callbacks,
+and FILTER/MAP preserve source SPLIT metadata.
 
 Strings use Unicode codepoints: valid UTF-16 surrogate pairs form one
 character, while lone surrogates remain individual codepoints. LENGTH, SLICE,
@@ -149,9 +171,9 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 5,240 conformance cases across twenty-five
+`all` runs both in parallel. All 6,521 conformance cases across thirty-two
 collections and local implementation tests are active without TODO markers.
-The default adapter explicitly skips the thirty-three cases with `needProto: true`
+The default adapter explicitly skips the thirty-eight cases with `needProto: true`
 when `forbidProto` is enabled. Names and descriptions do not affect skipping.
 Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
 restriction; host-restriction tests separately verify rejection on every engine.

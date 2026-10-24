@@ -26,9 +26,11 @@ var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, S
 var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
    HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11, WITH: 12,
    SEQ: 13, SEQMAX: 14, SEQMIN: 15,
-   REP: 16, START: 17, END: 18, CAPTURE: 50,
-   LOCAL: 51, NOT: 52, LENGTH: 55, SLICE: 57, CONCAT: 58, SPLIT: 62, JOIN: 63, MKOBJ: 65, CASE: 66, FAIL: 67,
-   CASTBOOL: 68, CASTNUM: 69, CASTSTR: 70, CASTDATE: 71};
+   REP: 16, START: 17, END: 18, CHARS: 19, CAPTURE: 50,
+   LOCAL: 51, NOT: 52, LENGTH: 55, CURPROP: 56, SLICE: 57, CONCAT: 58,
+   REDUCE: 59, FILTER: 60, MAP: 61, SPLIT: 62, JOIN: 63, MKOBJ: 65, CASE: 66, FAIL: 67,
+   CASTBOOL: 68, CASTNUM: 69, CASTSTR: 70, CASTDATE: 71, LESS: 72, LESSEQ: 73,
+   ADD: 74, SUB: 75, MUL: 76, DIV: 77, MOD: 78};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
 // Checking an inherited sentinel also works when descriptors are unavailable.
 var protoProbe= {};
@@ -236,17 +238,6 @@ function dateComparable(state, value, depth) {
       }
    }
    return parts;
-}
-
-function dateEqual(state, left, right, depth) {
-   var a= dateRecord(state, left), b= dateRecord(state, right), i;
-   if (a.count !== b.count) return false;
-   left= dateComparable(state, a, depth);
-   right= dateComparable(state, b, depth);
-   charge(state, a.count);
-   for (i= 0; i < a.count; i++)
-      if (left[i] !== right[i]) return false;
-   return true;
 }
 
 // Only parents containing private dates change. Such parents are owned:
@@ -1116,6 +1107,19 @@ function valueScope(state, scope, value) {
    return result;
 }
 
+// Position is independent of value existence. Regex cursors use a virtual
+// one-slot array, so report their logical codepoint index directly instead.
+function currentProperty(state, scope, depth) {
+   var keys= scope.node.keys, parent, key, kind;
+   if (scope.regex) return scope.regex.position;
+   if (!keys.length) return null;
+   key= keys[keys.length - 1];
+   parent= read(state, parentReference(state, scope.node), depth);
+   kind= type(parent);
+   if (kind === "array") return key === false? parent.length : key < 0? parent.length + key : key;
+   return kind === "object" || kind === "date"? key : null;
+}
+
 // LOCAL evaluates binding names and can rebind NODE with null. WITH accepts
 // only literal string/integer TEMP names. Both assign sequentially into a
 // private shallow TEMP root, leaving caller holders and nested data untouched.
@@ -1559,7 +1563,7 @@ function sequenceValue(state, expression, scope, depth, options, cursor) {
          }
          return sequenceElement(state, expression, scope, depth, mode, cursor, position, 0);
       }
-      if (cursor.info && (id === null || id < 1 || id > 18 || mode & 4 && (id < 6 || id > 12))) {
+      if (cursor.info && (id === null || id < 1 || id > 19 || mode & 4 && (id < 6 || id > 12 && id !== 19))) {
          if (id !== null || mode & 4) {
             expression= borrow(state, expression, scope, depth + 1);
             kind= type(expression);
@@ -1748,6 +1752,8 @@ function matchValue(state, expression, scope, depth, mode, target) {
          ? operation(state, expression, expressions) : null;
       if (id === -5)
          return match(state, macro(state, expression, scope, depth), scope, depth + 1, mode | 4, target);
+      if (id === 19)
+         return charsMatch(state, expression, target || scope, depth);
       if (id === 12) {
          local= bindingScope(state, expression, target || scope, depth, false);
          return argument(state, expression, expression.length - 1, local, depth, match, mode & 1);
@@ -1828,7 +1834,7 @@ function matchValue(state, expression, scope, depth, mode, target) {
       return false;
    if (kind !== "array" && kind !== "object") {
       charge(state, kind === "string"? (expression.length + value.length) * 0.001 : 1);
-      return kind === "date"? dateEqual(state, expression, value, depth) : expression === value;
+      return kind === "date"? compare(state, expression, value, depth) === 0 : expression === value;
    }
    if (kind === "array") {
       local= sequenceCursor(state, scope, value);
@@ -1944,7 +1950,7 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       state.element= referenceElement(state, reference, depth);
       return value;
    }
-   if (id >= 1 && id <= 12 || id === 17 || id === 18)
+   if (id >= 1 && id <= 12 || id >= 17 && id <= 19)
       return match(state, expression, scope, depth);
    if (id === 50) {
       arity(state, expression, 2, 2);
@@ -1968,6 +1974,21 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
          : argument(state, expression, 1, scope, depth, borrow);
       return id === 55? lengthOf(state, value) : id === 71? castDate(state, value) : cast(state, id, value, depth);
    }
+   if (id === 72 || id === 73) {
+      arity(state, expression, 2, 3);
+      value= expression.length === 2? read(state, scope.node, depth)
+         : argument(state, expression, 1, scope, depth, borrow);
+      value= compare(state, value, argument(state, expression, expression.length - 1, scope, depth, borrow), depth);
+      return id === 72? value < 0 : value <= 0;
+   }
+   if (id >= 74 && id <= 78)
+      return math(state, expression, scope, depth, id);
+   if (id === 56) {
+      arity(state, expression, 1, 1);
+      return currentProperty(state, scope, depth);
+   }
+   if (id >= 59 && id <= 61)
+      return iterate(state, expression, scope, depth, id);
    if (id === 57)
       return slice(state, expression, scope, depth);
    if (id === 58)
@@ -2016,6 +2037,222 @@ function character(info, offset, step) {
          return step? 2 : 0x10000 + (first - 0xD800) * 1024 + second - 0xDC00;
    }
    return step? 1 : first;
+}
+
+// Return -1/0/1 for orderable same-type values. Arrays visit each required
+// pair once, stopping at the first difference; unsupported visited elements
+// still fail even when identical. Date precision is part of its logical type.
+function compare(state, left, right, depth) {
+   var kind= type(left), a, b, info, other, result, i= 0, j= 0;
+   charge(state, 1, 0, 0, depth);
+   if (kind !== type(right)) fail(state, "INVALID_TARGET", "Comparison requires matching types");
+   if (kind === "date") {
+      a= dateRecord(state, left);
+      b= dateRecord(state, right);
+      if (a.count !== b.count) fail(state, "INVALID_TARGET", "Comparison requires matching date precision");
+      left= dateComparable(state, a, depth);
+      right= dateComparable(state, b, depth);
+      kind= "array";
+   }
+   if (kind === "string") {
+      info= stringInfo(state, left);
+      other= stringInfo(state, right);
+      charge(state, (left.length + right.length) * 0.001);
+   }
+   // Native code-unit order agrees with codepoint order when neither string
+   // has a surrogate pair. Otherwise decode only the compared prefix.
+   if (kind === "array" || info && (info.checkpoints || other.checkpoints)) {
+      while (i < left.length && j < right.length) {
+         charge(state, 1);
+         if (info) {
+            a= character(info, i);
+            b= character(other, j);
+         } else {
+            if (!present(state, left, i) || !present(state, right, j))
+               fail(state, "INVALID_TARGET", "Cannot compare a missing or pending-deletion element");
+            a= get(left, i);
+            b= get(right, j);
+         }
+         result= info? a - b : compare(state, a, b, depth + 1);
+         if (result) return result < 0? -1 : 1;
+         i+= info? character(info, i, true) : 1;
+         j+= info? character(other, j, true) : 1;
+      }
+      left= left.length - i;
+      right= right.length - j;
+   } else if (kind !== "number" && kind !== "boolean" && kind !== "string")
+      fail(state, "INVALID_TARGET", "This type is not orderable");
+   if (left !== left || right !== right) fail(state, "INVALID_TARGET", "NaN is not orderable");
+   return left < right? -1 : left > right? 1 : 0;
+}
+
+// Fold explicit value operands, or ADD/MUL's sole array operand as numeric
+// data. Every operand is checked, including factors after zero. Math returns
+// only finite numbers; MOD corrects remainder signs without a second division.
+function math(state, expression, scope, depth, id) {
+   var fold= id === 74 || id === 76, single= expression.length === 2;
+   var source, array= false, count= expression.length - 1, result= id === 76? 1 : 0, value, i;
+   arity(state, expression, fold? 1 : 3, fold? Infinity : 3);
+   if (single) {
+      source= argument(state, expression, 1, scope, depth, borrow);
+      array= type(source) === "array";
+      if (array) count= source.length;
+   }
+   charge(state, count);
+   for (i= 0; i < count; i++) {
+      if (array && !present(state, source, i))
+         fail(state, "INVALID_TARGET", "Cannot enumerate a missing or pending-deletion element");
+      value= array? get(source, i) : single? source : argument(state, expression, i + 1, scope, depth, borrow);
+      if (typeof value !== "number") fail(state, "INVALID_TARGET", "Math requires numeric operands");
+      if (!fold && !i)
+         result= value;
+      else {
+         if (id >= 77 && value === 0) fail(state, "INVALID_TARGET", "Division by zero");
+         result= id === 74? result + value : id === 75? result - value
+            : id === 76? result * value : id === 77? result / value : result % value;
+         if (id === 78 && result && (result < 0) !== (value < 0)) {
+            result+= value;
+            // Floating correction may round to the excluded divisor boundary.
+            if (result === value && isFinite(value)) result= 0;
+         }
+         if (!isFinite(result)) fail(state, result !== result? "INVALID_TARGET" : "UNSUPPORTED_GRAFT", "Nonfinite arithmetic result");
+      }
+   }
+   return result;
+}
+
+// A singleton operand is a codepoint, one-codepoint string, or null (maximum).
+// Other strings and operand categories return -1 for the class parser.
+function charPoint(state, value) {
+   var info;
+   if (value === null) return 1114111;
+   if (typeof value === "number") {
+      if (!integer(value) || value < 0 || value > 1114111)
+         fail(state, "INVALID_OPERAND", "Invalid Unicode codepoint");
+      return value;
+   }
+   if (typeof value === "string") {
+      info= stringInfo(state, value);
+      if (character(info, 0, true) === value.length) return character(info, 0);
+   }
+   return -1;
+}
+
+function numericOrder(left, right) {return left - right;}
+
+// Sorted toggle boundaries describe half-open intervals. Decode a list once,
+// then coalesce duplicates/adjacent points without enumerating any ranges.
+function charList(state, text) {
+   var info= stringInfo(state, text), points= make(state, true), result= make(state, true), i, point;
+   charge(state, text.length * 3, text.length * 24);
+   for (i= 0; i < text.length; i+= character(info, i, true)) points.push(character(info, i));
+   charge(state, points.length * (1 + Math.log(points.length || 1) / Math.LN2));
+   points.sort(numericOrder);
+   for (i= 0; i < points.length; i++) {
+      point= points[i];
+      if (!result.length || point > result[result.length - 1]) result.push(point, point + 1);
+      else if (point === result[result.length - 1]) result[result.length - 1]++;
+   }
+   return result;
+}
+
+// Merge inversion lists as union (include) or subtraction (exclude). Inputs
+// remain immutable, allowing imported/cached classes to share boundary arrays.
+function charCombine(state, left, right, include) {
+   var result= make(state, true), i= 0, j= 0, a= false, b= false, previous= false, point, inside;
+   charge(state, (left.length + right.length) * 2, (left.length + right.length) * 8);
+   while (i < left.length || j < right.length) {
+      point= Math.min(i < left.length? left[i] : Infinity, j < right.length? right[j] : Infinity);
+      if (left[i] === point) {a= !a; i++;}
+      if (right[j] === point) {b= !b; j++;}
+      inside= include? a || b : a && !b;
+      if (inside !== previous) result.push(point);
+      previous= inside;
+   }
+   return result;
+}
+
+// Compile literal classes per application and common-expression namespace.
+// Computed EXPR names (including aliases) disable caching for their parents;
+// they may depend on the current character or a lexical TEMP binding.
+function charClass(state, expression, scope, depth) {
+   var cache= state.charsets || (state.charsets= make(state, true)), result, value, child, source, level;
+   var include= true, first, last, i, id;
+   charge(state, cache.length, 0, 0, depth);
+   for (i= 0; i < cache.length; i++)
+      if (cache[i].source === expression && cache[i].scope === scope.expr) return cache[i];
+   result= make(state);
+   result.source= expression;
+   result.scope= scope.expr;
+   result.dynamic= false;
+   result.points= make(state, true);
+   charge(state, expression.length);
+   for (i= 1; i < expression.length; i++) {
+      value= get(expression, i);
+      if (typeof value === "boolean") {
+         include= value;
+         if (i === 1 && !value) {
+            charge(state, 1, 16);
+            result.points.push(0, 1114112);
+         }
+         continue;
+      }
+      if (type(value) === "array") {
+         state.graftPath.push(i);
+         source= value;
+         level= depth;
+         do {
+            charge(state, 1, 0, 0, ++level);
+            id= get(source, 0);
+            if (id !== "EXPR" && id !== -5)
+               fail(state, "INVALID_OPERAND", "CHARS operands must reference a CHARS expression");
+            if (type(get(source, 1)) === "array") result.dynamic= true;
+            source= macro(state, source, scope, level);
+         } while (type(source) === "array" && (get(source, 0) === "EXPR" || get(source, 0) === -5));
+         if (type(source) !== "array" || get(source, 0) !== "CHARS" && get(source, 0) !== 19)
+            fail(state, "INVALID_OPERAND", "Common expression must resolve to CHARS");
+         child= charClass(state, source, scope, level);
+         result.dynamic= result.dynamic || child.dynamic;
+         child= child.points;
+         state.graftPath.pop();
+      } else {
+         if (value !== null && typeof value !== "number" && typeof value !== "string")
+            fail(state, "INVALID_OPERAND", "Invalid CHARS operand");
+         first= argument(state, expression, i, scope, depth, charPoint);
+         if (first < 0)
+            child= charList(state, value);
+         else {
+            last= i + 1 < expression.length? argument(state, expression, i + 1, scope, depth, charPoint) : -1;
+            if (last < 0) last= first;
+            else i++;
+            if (first > last) fail(state, "INVALID_OPERAND", "Descending character range");
+            child= make(state, true);
+            charge(state, 1, 16);
+            child.push(first, last + 1);
+         }
+      }
+      result.points= charCombine(state, result.points, child, include);
+   }
+   if (!result.dynamic) {
+      charge(state, 1, 8);
+      cache.push(result);
+   }
+   return result;
+}
+
+function charsMatch(state, expression, scope, depth) {
+   var points= charClass(state, expression, scope, depth).points, value= read(state, scope.node, depth);
+   var low= 0, high= points.length, middle;
+   if (typeof value !== "number" && typeof value !== "string") return false;
+   value= charPoint(state, value);
+   if (value < 0) return false;
+   charge(state, 1 + Math.log(high + 1) / Math.LN2);
+   while (low < high) {
+      middle= Math.floor((low + high) / 2);
+      if (points[middle] <= value) low= middle + 1;
+      else high= middle;
+   }
+   return !!(low % 2);
 }
 
 // Keep immutable strings and small indexes per application. The fixed two-unit
@@ -2185,6 +2422,47 @@ function concat(state, expression, scope, depth) {
    return result;
 }
 
+// Iterate with NODE aliasing source[index]. REDUCE borrows each read-only
+// accumulator and materializes only its final result. FILTER copies selected
+// source values; MAP constructs one result per element. Both carry source
+// metadata, never metadata from a transform's returned element reference.
+function iterate(state, expression, scope, depth, id) {
+   var reduce= id === 59, map= id === 61, minimum= reduce? 4 : 2;
+   var name, accumulator, source, local, entries, value, result, i;
+   arity(state, expression, minimum, minimum + 1);
+   if (reduce) {
+      name= get(expression, 2);
+      if (typeof name !== "string" && typeof name !== "number")
+         fail(state, "INVALID_OPERAND", "REDUCE requires a literal string or number accumulator name");
+      name= String(name);
+      accumulator= argument(state, expression, 3, scope, depth, borrow);
+   }
+   source= expression.length > minimum? argument(state, expression, minimum, scope, depth, borrow)
+      : read(state, scope.node, depth);
+   if (type(source) !== "array") fail(state, "INVALID_TARGET", "Iteration requires an array");
+   local= valueScope(state, scope, source);
+   local.node.keys.push(0);
+   if (reduce)
+      local.temp= holder(state, copy(state, scope.temp.value, depth, true), true);
+   else
+      entries= make(state, true);
+   charge(state, source.length);
+   for (i= 0; i < source.length; i++) {
+      if (!present(state, source, i)) fail(state, "INVALID_TARGET", "Cannot iterate a missing or pending-deletion element");
+      local.node.keys[0]= i;
+      if (reduce) put(state, local.temp.value, name, accumulator);
+      value= argument(state, expression, 1, local, depth, reduce? borrow : map? evaluate : match);
+      if (reduce)
+         accumulator= value;
+      else if (map || value)
+         entry(state, entries, map? value : copy(state, get(source, i), depth + 1), true, elementAt(state, source, i));
+   }
+   if (reduce) return copy(state, accumulator, depth);
+   result= make(state, true);
+   rebuild(state, result, make(state), entries);
+   return result;
+}
+
 // Materialize operands once in caller scope, then select alternating pairs,
 // parallel arrays, or a pair list by their evaluated shapes. All values are
 // independently owned; only string, unique own keys reach the safe writer.
@@ -2234,7 +2512,7 @@ function splitPattern(state, source, scope, depth) {
       if (id !== -5) break;
       expression= macro(state, expression, scope, depth++);
    }
-   result.regex= id !== null && id >= 1 && id <= 18;
+   result.regex= id !== null && id >= 1 && id <= 19;
    result.expression= result.regex? expression : borrow(state, source, scope, depth);
    if (!result.regex && typeof result.expression !== "string")
       fail(state, "INVALID_OPERAND", "SPLIT requires string or regex patterns");
