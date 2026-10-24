@@ -1,5 +1,14 @@
 (function(global) {
 "use strict";
+// Shared error-code strings retain their public values after minification.
+var invalidTarget= "INVALID_TARGET",
+   invalidOperand= "INVALID_OPERAND",
+   invalidGraft= "INVALID_GRAFT",
+   unsupportedGraft= "UNSUPPORTED_GRAFT";
+
+// All execution is synchronous. Helpers share this private attempt binding;
+// apply() restores it in finally, including after reentrant host calls.
+var activeState;
 
 // Capture trusted methods once; input objects can shadow any of these names.
 var hasOwn= Object.prototype.hasOwnProperty;
@@ -22,15 +31,81 @@ var surrogatePair= /[\uD800-\uDBFF][\uDC00-\uDFFF]/;
 var jsonNumber= /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?(?![\s\S])/;
 var nonzeroMantissa= /^[^eE]*[1-9]/;
 var defaults= {mem: 67108864, ops: 1000000, new_obj: 100000, depth: 128};
-var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6, LOG: 10};
-var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
-   HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11, WITH: 12,
-   SEQ: 13, SEQMAX: 14, SEQMIN: 15,
-   REP: 16, START: 17, END: 18, CHARS: 19, CAPTURE: 50,
-   LOCAL: 51, NOT: 52, AND: 53, OR: 54, LENGTH: 55, CURPROP: 56, SLICE: 57, CONCAT: 58,
-   REDUCE: 59, FILTER: 60, MAP: 61, SPLIT: 62, JOIN: 63, PROPS: 64, MKOBJ: 65, CASE: 66, FAIL: 67,
-   CASTBOOL: 68, CASTNUM: 69, CASTSTR: 70, CASTDATE: 71, LESS: 72, LESSEQ: 73,
-   ADD: 74, SUB: 75, MUL: 76, DIV: 77, MOD: 78};
+// Private numeric constants are deliberately immutable so Terser can fold
+// names and exclusive bounds such as HAS - 1 back into literal digits.
+var ACT_JGRAFT= -1,
+   ACT_AT= 0,
+   ACT_MATCH= 1,
+   ACT_IF= 2,
+   ACT_COPY= 3,
+   ACT_MOVE= 4,
+   ACT_SPLICE= 5,
+   ACT_SPLIT= 6,
+   ACT_LOG= 10;
+var EXPR= -5,
+   CAP= -4,
+   TEMP= -3,
+   STASH= -2,
+   CONST= -1,
+   NODE= 0,
+   HAS= 1,
+   IS= 2,
+   NONE= 3,
+   ANY= 4,
+   ALL= 5,
+   EXISTS= 6,
+   ARRAY= 7,
+   STR= 8,
+   NUM= 9,
+   BOOL= 10,
+   DATE= 11,
+   WITH= 12,
+   SEQ= 13,
+   SEQMAX= 14,
+   SEQMIN= 15,
+   REP= 16,
+   START= 17,
+   END= 18,
+   CHARS= 19,
+   CAPTURE= 50,
+   LOCAL= 51,
+   NOT= 52,
+   AND= 53,
+   OR= 54,
+   LENGTH= 55,
+   CURPROP= 56,
+   SLICE= 57,
+   CONCAT= 58,
+   REDUCE= 59,
+   FILTER= 60,
+   MAP= 61,
+   SPLIT= 62,
+   JOIN= 63,
+   PROPS= 64,
+   MKOBJ= 65,
+   CASE= 66,
+   FAIL= 67,
+   CASTBOOL= 68,
+   CASTNUM= 69,
+   CASTSTR= 70,
+   CASTDATE= 71,
+   LESS= 72,
+   LESSEQ= 73,
+   ADD= 74,
+   SUB= 75,
+   MUL= 76,
+   DIV= 77,
+   MOD= 78;
+var TYPE_NULL= 0, TYPE_BOOLEAN= 1, TYPE_NUMBER= 2, TYPE_STRING= 3, TYPE_ARRAY= 4, TYPE_OBJECT= 5, TYPE_DATE= 6;
+var actions= {JGRAFT: ACT_JGRAFT, AT: ACT_AT, MATCH: ACT_MATCH, IF: ACT_IF, COPY: ACT_COPY, MOVE: ACT_MOVE, SPLICE: ACT_SPLICE, SPLIT: ACT_SPLIT, LOG: ACT_LOG};
+var expressions= {EXPR: EXPR, CAP: CAP, TEMP: TEMP, STASH: STASH, CONST: CONST, NODE: NODE,
+   HAS: HAS, IS: IS, NONE: NONE, ANY: ANY, ALL: ALL, EXISTS: EXISTS, ARRAY: ARRAY, STR: STR, NUM: NUM, BOOL: BOOL, DATE: DATE, WITH: WITH,
+   SEQ: SEQ, SEQMAX: SEQMAX, SEQMIN: SEQMIN,
+   REP: REP, START: START, END: END, CHARS: CHARS, CAPTURE: CAPTURE,
+   LOCAL: LOCAL, NOT: NOT, AND: AND, OR: OR, LENGTH: LENGTH, CURPROP: CURPROP, SLICE: SLICE, CONCAT: CONCAT,
+   REDUCE: REDUCE, FILTER: FILTER, MAP: MAP, SPLIT: SPLIT, JOIN: JOIN, PROPS: PROPS, MKOBJ: MKOBJ, CASE: CASE, FAIL: FAIL,
+   CASTBOOL: CASTBOOL, CASTNUM: CASTNUM, CASTSTR: CASTSTR, CASTDATE: CASTDATE, LESS: LESS, LESSEQ: LESSEQ,
+   ADD: ADD, SUB: SUB, MUL: MUL, DIV: DIV, MOD: MOD};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
 // Checking an inherited sentinel also works when descriptors are unavailable.
 var protoProbe= {};
@@ -54,7 +129,7 @@ protoProbe= null;
 function owns(value, key) {
    // Old JavaScriptCore reports its magic __proto__ accessor as an own
    // property even when no data property exists; descriptors disambiguate it.
-   return value !== null && value !== undefined && (key === "__proto__"
+   return !isNull(value) && value !== undefined && (key === "__proto__"
       ? getDescriptor? !!getDescriptor(value, key) : enumerable.call(value, key)
       : hasOwn.call(value, key));
 }
@@ -68,24 +143,37 @@ function get(value, key) {
       : ordinaryProto? value[key] : undefined : value[key];
 }
 
-// Built-in tags recognize arrays/Dates without trusting an input constructor.
+// Internal type tags: 0=null, 1=boolean, 2=number, 3=string, 4=array, 5=object, 6=date.
+// Unsupported primitive categories retain their native typeof names.
+// Use trusted built-ins once per object, never an input constructor or method.
 function type(value) {
-   return value === null? "null" : typeof value !== "object"? typeof value
-      : objectTag.call(value) === "[object Array]"? "array"
-      : value instanceof DateValue || objectTag.call(value) === "[object Date]"? "date" : "object";
+   var kind= typeof value;
+   if (isNull(value)) return TYPE_NULL;
+   if (kind !== "object")
+      return kind === "boolean"? TYPE_BOOLEAN : kind === "number"? TYPE_NUMBER : kind === "string"? TYPE_STRING : kind;
+   kind= objectTag.call(value);
+   return kind === "[object Array]"? TYPE_ARRAY
+      : value instanceof DateValue || kind === "[object Date]"? TYPE_DATE : TYPE_OBJECT;
 }
 
+// Shared predicates amortize repeated primitive and logical-array tests.
+function isNull(value) {return value === null;}
+function isBoolean(value) {return typeof value === "boolean";}
+function isNumber(value) {return typeof value === "number";}
+function isString(value) {return typeof value === "string";}
+function isArray(value) {return type(value) === TYPE_ARRAY;}
+
 function integer(value) {
-   return typeof value === "number" && isFinite(value) && Math.floor(value) === value;
+   return isNumber(value) && isFinite(value) && Math.floor(value) === value;
 }
 
 // Private immutable date values retain calendar precision, leap seconds, and
 // the original minute offset. They are never exposed in the target tree.
-function DateValue(state, parts, count) {
-   charge(state, 1, 48, 1);
+function DateValue(parts, count) {
+   charge(1, 48, 1);
    this.parts= parts;
    this.count= count;
-   state.dates= true;
+   activeState.dates= true;
 }
 
 function monthDays(year, month) {
@@ -95,56 +183,56 @@ function monthDays(year, month) {
 
 // Truncate decimal digits before numeric conversion, avoiding binary rounding
 // of a millisecond-exact field or a carry into the next second/day.
-function dateSecond(state, whole, fraction) {
-   var removed= stringSlice.call(fraction, state.dateDigits);
-   if (!state.truncateDateResolution && regexpTest.call(nonzeroMantissa, removed))
-      fail(state, "UNSUPPORTED_GRAFT", "Date resolution would lose fractional seconds");
-   return state.dateDigits && fraction? Number(whole + "." + stringSlice.call(fraction, 0, state.dateDigits)) : whole;
+function dateSecond(whole, fraction) {
+   var removed= stringSlice.call(fraction, activeState.dateDigits);
+   if (!activeState.truncateDateResolution && regexpTest.call(nonzeroMantissa, removed))
+      fail(unsupportedGraft, "Date resolution would lose fractional seconds");
+   return activeState.dateDigits && fraction? Number(whole + "." + stringSlice.call(fraction, 0, activeState.dateDigits)) : whole;
 }
 
 // Borrow internal values, or extract a native Date using trusted UTC methods.
 // Native Dates represent timestamps; their mutability stays outside expressions.
-function dateRecord(state, value) {
+function dateRecord(value) {
    var parts, i;
    if (value instanceof DateValue) return value;
-   if (type(value) !== "date" || !isFinite(dateTime.call(value)))
-      fail(state, "INVALID_TARGET", "Expected a valid date");
-   parts= make(state, true);
-   charge(state, 24, 96);
+   if (type(value) !== TYPE_DATE || !isFinite(dateTime.call(value)))
+      fail(invalidTarget, "Expected a valid date");
+   parts= make(true);
+   charge(24, 96);
    for (i= 0; i < 6; i++) parts[i]= dateGetters[i].call(value);
    parts[1]++;
    parts[5]= Number(parts[5] + "." + datePad(dateGetters[6].call(value), 3));
    parts[6]= 0;
-   return new DateValue(state, parts, 7);
+   return new DateValue(parts, 7);
 }
 
-function dateProperty(state, value, key) {
-   var record= dateRecord(state, value), i;
-   charge(state, record.count);
+function dateProperty(value, key) {
+   var record= dateRecord(value), i;
+   charge(record.count);
    for (i= 0; i < record.count; i++)
       if (dateFields[i] === key) return record.parts[i];
-   fail(state, "INVALID_TARGET", "Missing virtual date property");
+   fail(invalidTarget, "Missing virtual date property");
 }
 
 // Parse only unambiguous required forms and numeric field objects. Validation
 // precedes resolution loss, so truncation cannot repair an invalid date/time.
-function castDate(state, value) {
+function castDate(value) {
    var kind= type(value), parts, count= 3, matched, i, second, fraction= "", text;
    if (value instanceof DateValue) return value;
-   if (kind === "date") {
-      if (!isFinite(dateTime.call(value))) fail(state, "INVALID_TARGET", "Invalid native Date");
-      return copy(state, value, 1);
+   if (kind === TYPE_DATE) {
+      if (!isFinite(dateTime.call(value))) fail(invalidTarget, "Invalid native Date");
+      return copy(value, 1);
    }
-   parts= make(state, true);
-   charge(state, 7, 56);
-   if (kind === "string") {
-      charge(state, value.length * 5, value.length * 4 + 512, 1);
+   parts= make(true);
+   charge(7, 56);
+   if (kind === TYPE_STRING) {
+      charge(value.length * 5, value.length * 4 + 512, 1);
       matched= datePattern.exec(value);
       text= matched? matched[1] : "";
       if (!matched || text.length - (stringCode.call(text, 0) === 43 || stringCode.call(text, 0) === 45? 1 : 0) > 4 && !matched[2])
-         fail(state, "INVALID_TARGET", "Invalid date string");
+         fail(invalidTarget, "Invalid date string");
       parts[0]= Number(matched[1]);
-      if (!isFinite(parts[0])) fail(state, "UNSUPPORTED_GRAFT", "Date year is outside the host numeric range");
+      if (!isFinite(parts[0])) fail(unsupportedGraft, "Date year is outside the host numeric range");
       parts[1]= Number(matched[3]);
       parts[2]= Number(matched[4]);
       for (i= 3; i < 6; i++) parts[i]= matched[i + 2] === undefined? 0 : Number(matched[i + 2]);
@@ -155,38 +243,38 @@ function castDate(state, value) {
          count= 7;
          if (matched[10]) {
             if (Number(matched[11]) > 23 || Number(matched[12] || 0) > 59)
-               fail(state, "INVALID_TARGET", "Invalid timezone offset");
+               fail(invalidTarget, "Invalid timezone offset");
             parts[6]= Number(matched[11]) * 60 + Number(matched[12] || 0);
             if (matched[10] !== "+") {
-               if (!parts[6]) fail(state, "INVALID_TARGET", "Negative zero timezone");
+               if (!parts[6]) fail(invalidTarget, "Negative zero timezone");
                parts[6]= -parts[6];
             }
          }
       }
-   } else if (kind === "object") {
+   } else if (kind === TYPE_OBJECT) {
       for (i= 0; i < 7; i++) {
          parts[i]= owns(value, dateFields[i])? get(value, dateFields[i]) : i === 1 || i === 2? 1 : i? 0 : undefined;
          if (i >= 3 && owns(value, dateFields[i])) count= i === 6? 7 : Math.max(count, 6);
       }
    } else
-      fail(state, "INVALID_TARGET", "Cannot infer a date from this value");
+      fail(invalidTarget, "Cannot infer a date from this value");
    for (i= 0; i < 7; i++) {
-      if (i === 5? typeof parts[i] !== "number" || !isFinite(parts[i]) : !integer(parts[i]))
-         fail(state, "INVALID_TARGET", "Date fields must be numeric");
+      if (i === 5? !isNumber(parts[i]) || !isFinite(parts[i]) : !integer(parts[i]))
+         fail(invalidTarget, "Date fields must be numeric");
    }
    if (parts[1] < 1 || parts[1] > 12 || parts[2] < 1 || parts[2] > monthDays(parts[0], parts[1])
          || parts[3] < 0 || parts[3] > 23 || parts[4] < 0 || parts[4] > 59
          || parts[5] < 0 || parts[5] >= 61 || Math.abs(parts[6]) > 1439)
-      fail(state, "INVALID_TARGET", "Date fields are out of range");
+      fail(invalidTarget, "Date fields are out of range");
    second= Math.floor(parts[5]);
-   if (kind === "object" && parts[5] !== second) {
-      charge(state, 1, 64);
+   if (kind === TYPE_OBJECT && parts[5] !== second) {
+      charge(1, 64);
       // Nonzero scientific spellings here are below one millisecond.
       text= String(parts[5]);
       fraction= text.indexOf("e") !== -1? "0001" : stringSlice.call(text, text.indexOf(".") + 1);
    }
-   parts[5]= dateSecond(state, second, fraction);
-   return new DateValue(state, parts, count);
+   parts[5]= dateSecond(second, fraction);
+   return new DateValue(parts, count);
 }
 
 // Native Date years fit six digits; internal years can use the whole supported
@@ -197,11 +285,11 @@ function datePad(value, width) {
    return text;
 }
 
-function dateString(state, value) {
+function dateString(value) {
    var parts= value.parts, year= Math.abs(parts[0]), text, second, offset= parts[6];
-   charge(state, 128, 1024);
-   text= year >= 1e21? scalarString(state, year) : String(year);
-   charge(state, text.length * 10, text.length * 20);
+   charge(128, 1024);
+   text= year >= 1e21? scalarString(year) : String(year);
+   charge(text.length * 10, text.length * 20);
    text= (parts[0] < 0? "-" : parts[0] > 9999? "+" : "")
       + datePad(text, parts[0] < 0 || parts[0] > 9999? 6 : 4)
       + "-" + datePad(parts[1], 2) + "-" + datePad(parts[2], 2);
@@ -217,10 +305,10 @@ function dateString(state, value) {
 
 // Normalize only minute offsets. Seconds (including leap seconds) stay intact;
 // a zone within one day needs at most one calendar-day boundary adjustment.
-function dateComparable(state, value, depth) {
+function dateComparable(value, depth) {
    var parts= value.parts, minute, day;
    if (value.count !== 7 || !parts[6]) return parts;
-   parts= copy(state, parts, depth, true);
+   parts= copy(parts, depth, true);
    minute= parts[3] * 60 + parts[4] - parts[6];
    parts[2]+= Math.floor(minute / 1440);
    minute= (minute % 1440 + 1440) % 1440;
@@ -243,28 +331,28 @@ function dateComparable(state, value, depth) {
 // Only parents containing private dates change. Such parents are owned:
 // expressions copy containers, and inserting a private date into shared input
 // first clones its parents. MOVE retains array identity/pending metadata here.
-function exportDates(state, value, depth) {
+function exportDates(value, depth) {
    var kind= type(value), names, key, child, converted, info, queue, i, j;
-   charge(state, 1, 0, 0, depth);
-   if (value instanceof DateValue) return dateString(state, value);
-   if (kind !== "array" && kind !== "object") return value;
-   names= keys(state, value);
-   charge(state, names.length);
+   charge(1, 0, 0, depth);
+   if (value instanceof DateValue) return dateString(value);
+   if (kind !== TYPE_ARRAY && kind !== TYPE_OBJECT) return value;
+   names= keys(value);
+   charge(names.length);
    for (i= 0; i < names.length; i++) {
       key= names[i];
       child= get(value, key);
-      converted= exportDates(state, child, depth + 1);
-      if (converted !== child) put(state, value, key, converted);
+      converted= exportDates(child, depth + 1);
+      if (converted !== child) put(value, key, converted);
    }
-   info= kind === "array" && state.moving? arrayInfo(state, value) : null;
+   info= kind === TYPE_ARRAY && activeState.moving? arrayInfo(value) : null;
    if (info && info.inserts) {
-      names= keys(state, info.inserts);
-      charge(state, names.length);
+      names= keys(info.inserts);
+      charge(names.length);
       for (i= 0; i < names.length; i++) {
          queue= get(info.inserts, names[i]);
-         charge(state, queue.length);
+         charge(queue.length);
          for (j= 0; j < queue.length; j++)
-            queue[j].value= exportDates(state, queue[j].value, depth + 1);
+            queue[j].value= exportDates(queue[j].value, depth + 1);
       }
    }
    return value;
@@ -284,6 +372,13 @@ function brokenJSON() {
    }
 }
 
+// A function fallback is lazy, so explicit options never invoke host probes.
+function booleanOption(config, name, fallback) {
+   var value= owns(config, name)? get(config, name) : typeof fallback === "function"? fallback() : fallback;
+   if (!isBoolean(value)) throw new TypeError("Invalid JGraft " + name + " option");
+   return value;
+}
+
 // new JGraft(graft[, config]) takes ownership of graft and its descendants.
 // Retained references must not be modified; future versions may cache analysis.
 // config.limits overrides the defaults above; Infinity disables a limit.
@@ -291,19 +386,13 @@ function JGraft(graft, config) {
    var supplied= get(config, "limits"), key, value;
    this._graft= graft;
    this._limits= {};
-   value= owns(config, "forbidProto")? get(config, "forbidProto") : brokenJSON();
-   if (typeof value !== "boolean")
-      throw new TypeError("Invalid JGraft forbidProto option");
-   this.forbidProto= value;
+   this.forbidProto= booleanOption(config, "forbidProto", brokenJSON);
    this._dateDigits= dateTime.call(new Date(1)) === 1? 3 : 0;
-   value= owns(config, "truncateDateResolution")? get(config, "truncateDateResolution") : this._dateDigits >= 3;
-   if (typeof value !== "boolean")
-      throw new TypeError("Invalid JGraft truncateDateResolution option");
-   this.truncateDateResolution= value;
+   this.truncateDateResolution= booleanOption(config, "truncateDateResolution", this._dateDigits >= 3);
    // Copy scalar limits so later changes to config cannot change this budget.
    for (key in defaults) {
       value= owns(supplied, key)? get(supplied, key) : defaults[key];
-      if (typeof value !== "number" || value < 0 || value !== value)
+      if (!isNumber(value) || value < 0 || value !== value)
          throw new TypeError("Invalid JGraft resource limit: " + key);
       this._limits[key]= value;
    }
@@ -313,8 +402,8 @@ function JGraft(graft, config) {
 
 // Each attempt owns its counters. mem is a conservative allocation estimate,
 // assuming no reclamation during the call; depth records the maximum reached.
-function charge(state, ops, mem, objects, depth) {
-   var counts= state.counts, key;
+function charge(ops, mem, objects, depth) {
+   var counts= activeState.counts, key;
    // Charge before allocating/iterating; failed counts include rejected work.
    // Include the fixed work of checking all four counters.
    counts.ops+= 4 + (ops || 0);
@@ -322,51 +411,51 @@ function charge(state, ops, mem, objects, depth) {
    counts.new_obj+= objects || 0;
    counts.depth= Math.max(counts.depth, depth || 0);
    for (key in defaults)
-      if (counts[key] > state.limits[key]) {
-         state.resource= key;
-         fail(state, "RESOURCE_LIMIT", "JGraft resource limit exceeded: " + key);
+      if (counts[key] > activeState.limits[key]) {
+         activeState.resource= key;
+         fail("RESOURCE_LIMIT", "JGraft resource limit exceeded: " + key);
       }
 }
 
 // Diagnostics retain the partial output, which may share input subtrees.
 // No tree cloning or serialization is needed while handling an error.
-function fail(state, code, message) {
+function fail(code, message) {
    var error= new Error(message);
    error.name= "JGraftError";
    error.code= code;
-   error.graftPath= state.graftPath.slice(0);
-   error.inputPath= state.inputPath.slice(0);
-   error.partial= state.tree? state.tree.value : state.input;
+   error.graftPath= activeState.graftPath.slice(0);
+   error.inputPath= activeState.inputPath.slice(0);
+   error.partial= activeState.tree? activeState.tree.value : activeState.input;
    // Keep this attempt's counters even after the instance is applied again.
-   error.counts= state.counts;
-   error.logs= state.logs;
-   error.limits= {mem: state.limits.mem, ops: state.limits.ops,
-      new_obj: state.limits.new_obj, depth: state.limits.depth};
-   if (state.resource)
-      error.resource= state.resource;
+   error.counts= activeState.counts;
+   error.logs= activeState.logs;
+   error.limits= {mem: activeState.limits.mem, ops: activeState.limits.ops,
+      new_obj: activeState.limits.new_obj, depth: activeState.limits.depth};
+   if (activeState.resource)
+      error.resource= activeState.resource;
    throw error;
 }
 
-function make(state, array) {
-   charge(state, 1, 32, 1);
+function make(array) {
+   charge(1, 32, 1);
    return array? [] : {};
 }
 
 // Called at charged property accesses/enumerations, including absent paths.
 // This is a host/configuration restriction, never a malformed-graft diagnosis.
-function property(state, key) {
-   if (state.forbidProto && key === "__proto__")
-      fail(state, "UNSUPPORTED_GRAFT", "Host configuration forbids __proto__ properties");
+function property(key) {
+   if (activeState.forbidProto && key === "__proto__")
+      fail(unsupportedGraft, "Host configuration forbids __proto__ properties");
 }
 
 // Account for enumeration, including inherited keys which must be ignored.
-function keys(state, value) {
-   var result= make(state, true), key;
+function keys(value) {
+   var result= make(true), key;
    for (key in value) {
-      charge(state, 1);
+      charge(1);
       if (owns(value, key)) {
-         property(state, key);
-         charge(state, 0, 8 + key.length * 2);
+         property(key);
+         charge(0, 8 + key.length * 2);
          result.push(key);
       }
    }
@@ -374,14 +463,14 @@ function keys(state, value) {
 }
 
 // Assign arbitrary own keys without invoking the legacy prototype setter.
-function put(state, object, key, value) {
-   property(state, key);
-   charge(state, 1 + String(key).length * 0.001,
+function put(object, key, value) {
+   property(key);
+   charge(1 + String(key).length * 0.001,
       owns(object, key)? 0 : 16 + String(key).length * 2);
    if (key === "__proto__" && !ordinaryProto) {
       if (!defineProperty || !getDescriptor)
-         fail(state, "UNSUPPORTED_GRAFT", "This engine cannot safely store __proto__ properties");
-      charge(state, 1, 48, 1);
+         fail(unsupportedGraft, "This engine cannot safely store __proto__ properties");
+      charge(1, 48, 1);
       // JavaScriptCore 1.9 can ignore value changes when redefining this key.
       // Our writable containers have configurable properties, so recreate it.
       if (recreateProto)
@@ -395,8 +484,8 @@ function put(state, object, key, value) {
 // Namespace holders keep both data and the parallel copy-on-write tree.
 // cloned=true means all descendants are owned; an object marks cloned parents
 // with per-child ownership under prefixed keys. Missing markers mean shared.
-function holder(state, value, cloned) {
-   var result= make(state);
+function holder(value, cloned) {
+   var result= make();
    result.value= value;
    result.cloned= cloned;
    return result;
@@ -407,207 +496,213 @@ function createState(instance, input) {
       dateDigits: instance._dateDigits, truncateDateResolution: instance.truncateDateResolution,
       counts: {mem: 0, ops: 0, new_obj: 0, depth: 0},
       graftPath: [], inputPath: [], logs: []};
+   activeState= state;
    // Publish before any limit check so failed attempts expose counts and logs.
    instance.counts= state.counts;
    instance.logs= state.logs;
-   charge(state, 1, 288, 5);
-   state.tree= holder(state, input, false);
-   state.arrays= make(state, true);
+   charge(1, 288, 5);
+   state.tree= holder(input, false);
+   state.arrays= make(true);
    return state;
 }
 
 // Copy JSON/Date data without interpreting arrays as expressions. shallow is
 // used only for copy-on-write parents; deep copies become wholly owned trees.
 // Supplying scope instead evaluates children in value context for construction.
-function copy(state, value, depth, shallow, scope) {
+function copy(value, depth, shallow, scope) {
    var kind= type(value), result, names, i, key, info, target;
-   charge(state, 1, 0, 0, depth);
-   if (kind === "date") {
+   charge(1, 0, 0, depth);
+   if (kind === TYPE_DATE) {
       if (value instanceof DateValue) return value;
       // Dates are mutable in JavaScript, so a copied value needs its own Date.
-      charge(state, 1, 48, 1);
+      charge(1, 48, 1);
       result= dateTime.call(value);
-      if (!state.dateDigits && isFinite(result) && result % 1000) {
-         if (!state.truncateDateResolution)
-            fail(state, "UNSUPPORTED_GRAFT", "Date resolution would lose milliseconds");
+      if (!activeState.dateDigits && isFinite(result) && result % 1000) {
+         if (!activeState.truncateDateResolution)
+            fail(unsupportedGraft, "Date resolution would lose milliseconds");
          result= Math.floor(result / 1000) * 1000;
       }
       return new Date(result);
    }
-   if (kind === "array" || kind === "object") {
-      result= make(state, kind === "array");
-      names= keys(state, value);
-      charge(state, names.length);
-      if (kind === "array") {
+   if (kind === TYPE_ARRAY || kind === TYPE_OBJECT) {
+      result= make(kind === TYPE_ARRAY);
+      names= keys(value);
+      charge(names.length);
+      if (kind === TYPE_ARRAY) {
          // Preserve length independently of enumeration, including sparse data.
-         charge(state, 0, value.length * 8);
+         charge(0, value.length * 8);
          result.length= value.length;
       }
       for (i= 0; i < names.length; i++) {
          key= names[i];
-         if (!shallow && !present(state, value, key))
-            fail(state, "INVALID_TARGET", "Cannot enumerate a pending deletion");
-         put(state, result, key, scope? argument(state, value, key, scope, depth) : shallow? get(value, key)
-            : copy(state, get(value, key), depth + 1));
-         if (scope && kind === "array")
-            receiveElement(state, result, Number(key), state.element, true);
+         if (!shallow && !present(value, key))
+            fail(invalidTarget, "Cannot enumerate a pending deletion");
+         put(result, key, scope? argument(value, key, scope, depth) : shallow? get(value, key)
+            : copy(get(value, key), depth + 1));
+         if (scope && kind === TYPE_ARRAY)
+            receiveElement(result, Number(key), activeState.element, true);
       }
-      if (kind === "array" && !scope) {
-         info= arrayInfo(state, value);
+      if (kind === TYPE_ARRAY && !scope) {
+         info= arrayInfo(value);
          if (info && info.split) {
-            target= arrayInfo(state, result, true);
-            target.split= make(state);
+            target= arrayInfo(result, true);
+            target.split= make();
             target.split.origin= info.split.origin;
-            charge(state, info.split.items.length, 32 + info.split.items.length * 8, 1);
-            target.split.items= info.split.items.slice(0);
+            target.split.items= copyPath(info.split.items);
          }
       }
       return result;
    }
-   if (kind !== "null" && kind !== "boolean" && kind !== "string"
-         && (kind !== "number" || !isFinite(value)))
-      fail(state, "INVALID_TARGET", "Expected JSON data or a Date");
-   charge(state, kind === "string"? value.length * 0.001 : 0);
+   if (kind !== TYPE_NULL && kind !== TYPE_BOOLEAN && kind !== TYPE_STRING
+         && (kind !== TYPE_NUMBER || !isFinite(value)))
+      fail(invalidTarget, "Expected JSON data or a Date");
+   charge(kind === TYPE_STRING? value.length * 0.001 : 0);
    return value;
 }
 
 // Visit a child while retaining its location in the graft for diagnostics.
 // Optional handlers select action/path/construction contexts without wrappers.
 // Matching can also supply the scope to use after operand evaluation.
-function argument(state, source, key, scope, depth, handler, parameter, target) {
+function argument(source, key, scope, depth, handler, parameter, target) {
    var result;
-   charge(state, 1, 8);
-   state.graftPath.push(key);
-   result= (handler || evaluate)(state, get(source, key), scope, depth + 1, parameter, target);
-   state.graftPath.pop();
+   charge(1, 8);
+   activeState.graftPath.push(key);
+   result= (handler || evaluate)(get(source, key), scope, depth + 1, parameter, target);
+   activeState.graftPath.pop();
    return result;
 }
 
-function operation(state, expression, table, code) {
+// Resolve names and prove integer type. Each dispatcher validates its own
+// opcode set before relying on implied bounds in its decision tree.
+function operation(expression, table, code) {
    var id= get(expression, 0);
-   if (typeof id === "string")
+   if (isString(id))
       id= get(table, id);
    if (!integer(id))
-      fail(state, code || "INVALID_GRAFT", "Unknown action or expression");
+      fail(code || invalidGraft, "Unknown action or expression");
    return id;
 }
 
-function arity(state, expression, minimum, maximum) {
+function arity(expression, minimum, maximum) {
    if (expression.length < minimum || expression.length > maximum)
-      fail(state, "INVALID_GRAFT", "Invalid argument count");
+      fail(invalidGraft, "Invalid argument count");
 }
 
 // Return encoded syntax; the caller evaluates it in the current lexical scope.
-function macro(state, expression, scope, depth) {
+function macro(expression, scope, depth) {
    var name;
-   arity(state, expression, 2, 2);
-   name= argument(state, expression, 1, scope, depth);
-   if (typeof name !== "string" && !integer(name))
-      fail(state, "INVALID_OPERAND", "Invalid common expression name");
-   property(state, String(name));
+   arity(expression, 2, 2);
+   name= argument(expression, 1, scope, depth);
+   if (!isString(name) && !integer(name))
+      fail(invalidOperand, "Invalid common expression name");
+   property(String(name));
    if (!owns(scope.expr, String(name)))
-      fail(state, "INVALID_TARGET", "Missing common expression");
+      fail(invalidTarget, "Missing common expression");
    return get(scope.expr, String(name));
+}
+
+// Copy internal diagnostic/reference paths with traversal/allocation accounting.
+function copyPath(path) {
+   charge(path.length, 32 + path.length * 8, 1);
+   return path.slice(0);
 }
 
 // Begin evaluation at the current node. Reference walks refine this location;
 // otherwise a previous pair's destination must not leak into diagnostics.
-function location(state, scope) {
-   charge(state, scope.node.keys.length, 32 + scope.node.keys.length * 8, 1);
-   state.inputPath= scope.node.keys.slice(0);
+function location(scope) {
+   activeState.inputPath= copyPath(scope.node.keys);
 }
 
 // Flatten path arguments once. Literal selector faults are INVALID_GRAFT;
 // invalid results of computed expressions are INVALID_OPERAND.
-function path(state, expression, scope, depth, writing) {
-   var id, tree, selectors= make(state, true), item, expanded, i, j, code;
-   location(state, scope);
-   charge(state, 1, 0, 0, depth);
-   if (type(expression) === "object" || type(expression) === "date")
-      fail(state, writing >= 2 && writing <= 3? "INVALID_TARGET" : "INVALID_GRAFT",
+function path(expression, scope, depth, writing) {
+   var id, tree, selectors= make(true), item, expanded, i, j, code;
+   location(scope);
+   charge(1, 0, 0, depth);
+   if (type(expression) === TYPE_OBJECT || type(expression) === TYPE_DATE)
+      fail(writing >= 2 && writing <= 3? invalidTarget : invalidGraft,
          "Expected an implicit selector or reference expression");
-   if (type(expression) !== "array") {
-      charge(state, 1, 48, 1);
+   if (!isArray(expression)) {
+      charge(1, 48, 1);
       expression= ["NODE", expression];
    }
-   id= operation(state, expression, expressions,
-      writing >= 2 && writing <= 3? "INVALID_TARGET" : "INVALID_GRAFT");
-   if (id === -5)
-      return path(state, macro(state, expression, scope, depth), scope, depth + 1, writing);
-   tree= id === 0? scope.node.tree : id === -1? scope.constants
-      : id === -2? scope.stash : id === -3? scope.temp : id === -4? scope.cap : null;
-   if (!tree || writing && (id === -1 || id === -4))
-      fail(state, writing >= 2 && writing <= 3? tree? "INVALID_OPERAND" : "INVALID_TARGET"
-         : "INVALID_GRAFT", "Invalid reference namespace");
-   if (id === 0) {
-      charge(state, scope.node.keys.length, 32 + scope.node.keys.length * 8, 1);
-      selectors= scope.node.keys.slice(0);
+   id= operation(expression, expressions,
+      writing >= 2 && writing <= 3? invalidTarget : invalidGraft);
+   if (id === EXPR)
+      return path(macro(expression, scope, depth), scope, depth + 1, writing);
+   tree= id === NODE? scope.node.tree : id === CONST? scope.constants
+      : id === STASH? scope.stash : id === TEMP? scope.temp : id === CAP? scope.cap : null;
+   if (!tree || writing && (id === CONST || id === CAP))
+      fail(writing >= 2 && writing <= 3? tree? invalidOperand : invalidTarget
+         : invalidGraft, "Invalid reference namespace");
+   if (id === NODE) {
+      selectors= copyPath(scope.node.keys);
    }
-   charge(state, expression.length);
+   charge(expression.length);
    for (i= 1; i < expression.length; i++) {
       item= get(expression, i);
-      code= type(item) === "array"? "INVALID_OPERAND" : "INVALID_GRAFT";
-      item= argument(state, expression, i, scope, depth);
-      if (type(item) === "array")
+      code= isArray(item)? invalidOperand : invalidGraft;
+      item= argument(expression, i, scope, depth);
+      if (isArray(item))
          expanded= item;
       else {
-         charge(state, 1, 40, 1);
+         charge(1, 40, 1);
          expanded= [item];
       }
-      charge(state, expanded.length, expanded.length * 8);
+      charge(expanded.length, expanded.length * 8);
       for (j= 0; j < expanded.length; j++) {
          item= get(expanded, j);
-         property(state, item);
-         if (typeof item !== "string" && item !== false && !integer(item)
-               && !(writing === 3 && typeof item === "number" && integer(item * 2)))
-            fail(state, code, "Invalid path selector");
+         property(item);
+         if (!isString(item) && item !== false && !integer(item)
+               && !(writing === 3 && isNumber(item) && integer(item * 2)))
+            fail(code, "Invalid path selector");
          // These namespaces permit a leading integer as an object key.
-         selectors.push(selectors.length === 0 && id < 0 && id !== -4 && integer(item)? String(item) : item);
+         selectors.push(selectors.length === 0 && id < CONST + 1 && id !== CAP && integer(item)? String(item) : item);
       }
    }
-   if (id === -3 && !selectors.length || writing && id !== 0 && !selectors.length)
-      fail(state, writing >= 2 && writing <= 3? "INVALID_OPERAND" : "INVALID_GRAFT",
+   if (id === TEMP && !selectors.length || writing && id !== NODE && !selectors.length)
+      fail(writing >= 2 && writing <= 3? invalidOperand : invalidGraft,
          "Namespace root cannot be accessed this way");
-   charge(state, 1, 48, 1);
+   charge(1, 48, 1);
    return {tree: tree, keys: selectors, namespace: id};
 }
 
 // Resolve aliases against the current parent. No inherited value is readable.
-function selector(state, parent, key, writing) {
+function selector(parent, key, writing) {
    var kind= type(parent);
-   charge(state, 1);
-   property(state, key);
-   if (kind === "array" && writing === 2 && typeof key === "number"
+   charge(1);
+   property(key);
+   if (kind === TYPE_ARRAY && writing === 2 && isNumber(key)
          && integer(key * 2) && !integer(key)) {
       key= key < -0.5? parent.length + key : key;
       if (key >= -0.5 && key < parent.length)
          return key;
-   } else if (kind === "array" && (integer(key) || key === false)) {
+   } else if (kind === TYPE_ARRAY && (integer(key) || key === false)) {
       key= key === false? parent.length : key < 0? parent.length + key : key;
       if (key >= 0 && key < parent.length + (writing? 1 : 0))
          return key;
-   } else if (kind === "object" && typeof key === "string")
+   } else if (kind === TYPE_OBJECT && isString(key))
       return key;
-   else if (kind === "date" && !writing && typeof key === "string")
+   else if (kind === TYPE_DATE && !writing && isString(key))
       return key;
-   fail(state, "INVALID_TARGET", "Path selector does not address this container");
+   fail(invalidTarget, "Path selector does not address this container");
 }
 
-function read(state, reference, depth) {
+function read(reference, depth) {
    var value= reference.tree.value, i, key;
-   state.inputPath= make(state, true);
+   activeState.inputPath= make(true);
    if (reference.tree.deleted)
-      fail(state, "INVALID_TARGET", "Current node is temporarily deleted");
-   charge(state, reference.keys.length, reference.keys.length * 8);
+      fail(invalidTarget, "Current node is temporarily deleted");
+   charge(reference.keys.length, reference.keys.length * 8);
    for (i= 0; i < reference.keys.length; i++) {
-      charge(state, 1, 0, 0, depth + i);
-      key= selector(state, value, reference.keys[i], false);
-      state.inputPath.push(key);
-      if (type(value) === "date")
-         value= dateProperty(state, value, key);
+      charge(1, 0, 0, depth + i);
+      key= selector(value, reference.keys[i], false);
+      activeState.inputPath.push(key);
+      if (type(value) === TYPE_DATE)
+         value= dateProperty(value, key);
       else {
-         if (!present(state, value, key))
-            fail(state, "INVALID_TARGET", "Missing or pending-deletion source property");
+         if (!present(value, key))
+            fail(invalidTarget, "Missing or pending-deletion source property");
          value= get(value, key);
       }
       // AT retains these concrete indices rather than re-resolving aliases.
@@ -618,26 +713,26 @@ function read(state, reference, depth) {
 
 // Metadata is kept outside user arrays. Linear identity searches are charged;
 // moving an array therefore carries its pending edits without visiting its data.
-function arrayInfo(state, array, create) {
+function arrayInfo(array, create) {
    var i, info;
-   charge(state, state.arrays.length);
-   for (i= 0; i < state.arrays.length; i++)
-      if (state.arrays[i].array === array)
-         return state.arrays[i];
+   charge(activeState.arrays.length);
+   for (i= 0; i < activeState.arrays.length; i++)
+      if (activeState.arrays[i].array === array)
+         return activeState.arrays[i];
    if (!create)
       return null;
-   info= make(state);
+   info= make();
    info.array= array;
    info.split= null;
-   charge(state, 1, 8);
-   state.arrays.push(info);
+   charge(1, 8);
+   activeState.arrays.push(info);
    return info;
 }
 
 // During MOVE, deleted array slots hold null in the diagnostic tree while a
 // separate map makes them inaccessible. This keeps partial results JSON-shaped.
-function present(state, object, key) {
-   var info= state.moving && type(object) === "array"? arrayInfo(state, object) : null;
+function present(object, key) {
+   var info= activeState.moving && isArray(object)? arrayInfo(object) : null;
    return owns(object, key) && !(info && get(info.deleted, "$" + key));
 }
 
@@ -645,9 +740,9 @@ function childOwnership(mark, key) {
    return mark === true? true : owns(mark, "$" + key)? get(mark, "$" + key) : !!get(mark, "all");
 }
 
-function parentReference(state, reference) {
-   var result= make(state);
-   charge(state, reference.keys.length, reference.keys.length * 8 + 32, 1);
+function parentReference(reference) {
+   var result= make();
+   charge(reference.keys.length, reference.keys.length * 8 + 32, 1);
    result.tree= reference.tree;
    result.keys= reference.keys.slice(0, -1);
    return result;
@@ -657,53 +752,52 @@ function parentReference(state, reference) {
 // default for untouched children of an owned subtree; explicit false markers
 // let MOVE attach shared input data without incorrectly claiming ownership.
 // nextKey is the selector just beyond this reference when auto-vivifying.
-function edit(state, reference, depth, create, nextKey) {
+function edit(reference, depth, create, nextKey) {
    var tree= reference.tree, node= tree.value, mark= tree.cloned;
    var parent, parentMark, parentKey, key, child, i, result;
-   state.inputPath= make(state, true);
+   activeState.inputPath= make(true);
    if (tree.deleted) {
       if (!create)
-         fail(state, "INVALID_TARGET", "Current node is temporarily deleted");
-      node= make(state, typeof (reference.keys.length? reference.keys[0] : nextKey) !== "string");
+         fail(invalidTarget, "Current node is temporarily deleted");
+      node= make(!isString(reference.keys.length? reference.keys[0] : nextKey));
       tree.deleted= false;
       tree.value= node;
       mark= true;
    }
-   charge(state, reference.keys.length + 1, reference.keys.length * 8);
+   charge(reference.keys.length + 1, reference.keys.length * 8);
    for (i= 0; i <= reference.keys.length; i++) {
-      charge(state, 1, 0, 0, depth + i);
-      if (type(node) !== "object" && type(node) !== "array")
-         fail(state, "INVALID_TARGET", "Expected a writable container");
+      charge(1, 0, 0, depth + i);
+      if (type(node) !== TYPE_OBJECT && !isArray(node))
+         fail(invalidTarget, "Expected a writable container");
       if (!mark || mark === true) {
          if (!mark)
-            node= copy(state, node, depth + i, true);
-         child= make(state);
+            node= copy(node, depth + i, true);
+         child= make();
          child.all= mark === true;
          mark= child;
          if (i === 0) {
             tree.value= node;
             tree.cloned= mark;
          } else {
-            put(state, parent, parentKey, node);
-            put(state, parentMark, "$" + parentKey, mark);
+            put(parent, parentKey, node);
+            put(parentMark, "$" + parentKey, mark);
          }
       }
       if (i === reference.keys.length) {
-         result= make(state);
+         result= make();
          result.value= node;
          result.mark= mark;
          return result;
       }
-      key= selector(state, node, reference.keys[i], create);
-      state.inputPath.push(key);
+      key= selector(node, reference.keys[i], create);
+      activeState.inputPath.push(key);
       child= childOwnership(mark, key);
-      if (!present(state, node, key)) {
+      if (!present(node, key)) {
          if (!create)
-            fail(state, "INVALID_TARGET", "Missing parent property");
-         put(state, node, key, make(state,
-            typeof (i + 1 < reference.keys.length? reference.keys[i + 1] : nextKey) !== "string"));
-         put(state, mark, "$" + key, true);
-         revive(state, node, key);
+            fail(invalidTarget, "Missing parent property");
+         put(node, key, make(!isString(i + 1 < reference.keys.length? reference.keys[i + 1] : nextKey)));
+         put(mark, "$" + key, true);
+         revive(node, key);
          child= true;
       }
       parent= node;
@@ -714,18 +808,18 @@ function edit(state, reference, depth, create, nextKey) {
    }
 }
 
-function revive(state, array, key) {
-   var info= state.moving && type(array) === "array"? arrayInfo(state, array) : null;
+function revive(array, key) {
+   var info= activeState.moving && isArray(array)? arrayInfo(array) : null;
    if (info && info.deleted)
       delete info.deleted["$" + key];
 }
 
 // Assign a value with its ownership marker. COPY supplies true; MOVE transfers
 // the original marker, so modifying a moved shared branch still shallow-clones.
-function write(state, reference, value, depth, owned, element) {
+function write(reference, value, depth, owned, element) {
    var parent, key, inserting;
-   if (state.dates && reference.tree === state.tree)
-      value= exportDates(state, value, depth);
+   if (activeState.dates && reference.tree === activeState.tree)
+      value= exportDates(value, depth);
    if (owned === undefined)
       owned= true;
    if (!reference.keys.length) {
@@ -735,47 +829,47 @@ function write(state, reference, value, depth, owned, element) {
       return;
    }
    key= reference.keys[reference.keys.length - 1];
-   parent= edit(state, parentReference(state, reference), depth, true, key);
-   key= selector(state, parent.value, key, true);
-   state.inputPath.push(key);
-   inserting= key === parent.value.length || !present(state, parent.value, key);
-   put(state, parent.value, key, value);
-   if (type(parent.value) === "array")
-      receiveElement(state, parent.value, key, element, inserting, parent.mark);
-   put(state, parent.mark, "$" + key, owned);
-   revive(state, parent.value, key);
+   parent= edit(parentReference(reference), depth, true, key);
+   key= selector(parent.value, key, true);
+   activeState.inputPath.push(key);
+   inserting= key === parent.value.length || !present(parent.value, key);
+   put(parent.value, key, value);
+   if (isArray(parent.value))
+      receiveElement(parent.value, key, element, inserting, parent.mark);
+   put(parent.mark, "$" + key, owned);
+   revive(parent.value, key);
 }
 
 // Validate the destination against a virtual source removal before detaching
 // anything. Only absent containers are synthesized; scalars are never coerced.
-function destination(state, reference, source, depth) {
+function destination(reference, source, depth) {
    var value= reference.tree.value, absent= reference.tree.deleted, i, j, same, key;
-   state.inputPath= make(state, true);
-   charge(state, reference.keys.length);
+   activeState.inputPath= make(true);
+   charge(reference.keys.length);
    for (i= 0; i < reference.keys.length; i++) {
       same= source && source.tree === reference.tree && source.keys.length === i;
       if (same) {
-         charge(state, i);
+         charge(i);
          for (j= 0; j < i; j++)
             if (source.keys[j] !== reference.keys[j])
                same= false;
       }
       if (absent || same)
-         value= make(state, typeof reference.keys[i] !== "string");
-      charge(state, 1, 0, 0, depth + i);
-      key= selector(state, value, reference.keys[i], i === reference.keys.length - 1? 2 : true);
+         value= make(!isString(reference.keys[i]));
+      charge(1, 0, 0, depth + i);
+      key= selector(value, reference.keys[i], i === reference.keys.length - 1? 2 : true);
       reference.keys[i]= key;
-      state.inputPath.push(key);
-      absent= !present(state, value, key);
+      activeState.inputPath.push(key);
+      absent= !present(value, key);
       value= get(value, key);
    }
 }
 
-function sameReference(state, a, b) {
+function sameReference(a, b) {
    var i;
    if (!a || !b || a.tree !== b.tree || a.keys.length !== b.keys.length)
       return false;
-   charge(state, a.keys.length);
+   charge(a.keys.length);
    for (i= 0; i < a.keys.length; i++)
       if (a.keys[i] !== b.keys[i])
          return false;
@@ -784,167 +878,166 @@ function sameReference(state, a, b) {
 
 // Register the writable array once for end-of-MOVE rebuilding. Queued inserts
 // and deleted positions belong to this instance even after it changes namespace.
-function pending(state, array, mark) {
-   var info= arrayInfo(state, array, true);
+function pending(array, mark) {
+   var info= arrayInfo(array, true);
    if (!info.deleted) {
-      info.deleted= make(state);
-      info.inserts= make(state);
+      info.deleted= make();
+      info.inserts= make();
       info.mark= mark;
-      charge(state, 1, 8);
-      state.moving.push(info);
+      charge(1, 8);
+      activeState.moving.push(info);
    }
    return info;
 }
 
-function detach(state, reference, depth) {
-   var result= make(state), parent, key, info, replacement, names, i;
+function detach(reference, depth) {
+   var result= make(), parent, key, info, replacement, names, i;
    if (!reference.keys.length) {
       result.value= reference.tree.value;
       result.owned= reference.tree.cloned;
       reference.tree.value= null;
       reference.tree.deleted= true;
    } else {
-      parent= edit(state, parentReference(state, reference), depth, false);
+      parent= edit(parentReference(reference), depth, false);
       key= reference.keys[reference.keys.length - 1];
       result.value= get(parent.value, key);
       result.owned= childOwnership(parent.mark, key);
-      result.element= elementAt(state, parent.value, key);
-      if (type(parent.value) === "array") {
-         info= pending(state, parent.value, parent.mark);
-         put(state, parent.value, key, null);
-         put(state, info.deleted, "$" + key, true);
+      result.element= elementAt(parent.value, key);
+      if (isArray(parent.value)) {
+         info= pending(parent.value, parent.mark);
+         put(parent.value, key, null);
+         put(info.deleted, "$" + key, true);
          if (info.split)
             info.split.items[key]= null;
       } else if (key === "__proto__" && !deleteProto) {
          // V8 0.10 cannot delete this own property. Replace the writable
          // container, preserving its other child identities and ownership map.
-         replacement= make(state);
-         names= keys(state, parent.value);
-         charge(state, names.length);
+         replacement= make();
+         names= keys(parent.value);
+         charge(names.length);
          for (i= 0; i < names.length; i++)
             if (names[i] !== key)
-               put(state, replacement, names[i], get(parent.value, names[i]));
-         write(state, parentReference(state, reference), replacement, depth, parent.mark);
+               put(replacement, names[i], get(parent.value, names[i]));
+         write(parentReference(reference), replacement, depth, parent.mark);
       } else
          delete parent.value[key];
-      put(state, parent.mark, "$" + key, false);
+      put(parent.mark, "$" + key, false);
    }
    return result;
 }
 
-function move(state, expression, scope, depth) {
+function move(expression, scope, depth) {
    var source, target, item, parent, key, info, queue, i;
    if (expression.length % 2 !== 1)
-      fail(state, "INVALID_GRAFT", "MOVE requires source/destination pairs");
-   state.moving= make(state, true);
-   charge(state, expression.length);
+      fail(invalidGraft, "MOVE requires source/destination pairs");
+   activeState.moving= make(true);
+   charge(expression.length);
    for (i= 1; i < expression.length; i+= 2) {
-      source= get(expression, i) === null? null : argument(state, expression, i, scope, depth, path, 2);
-      target= get(expression, i + 1) === null? null : argument(state, expression, i + 1, scope, depth, path, 3);
+      source= isNull(get(expression, i))? null : argument(expression, i, scope, depth, path, 2);
+      target= isNull(get(expression, i + 1))? null : argument(expression, i + 1, scope, depth, path, 3);
       if (source) {
-         state.graftPath.push(i);
-         read(state, source, depth);
-         state.graftPath.pop();
+         activeState.graftPath.push(i);
+         read(source, depth);
+         activeState.graftPath.pop();
       }
       if (target) {
-         state.graftPath.push(i + 1);
-         destination(state, target, source, depth);
-         state.graftPath.pop();
+         activeState.graftPath.push(i + 1);
+         destination(target, source, depth);
+         activeState.graftPath.pop();
       }
-      if (sameReference(state, source, target))
+      if (sameReference(source, target))
          continue;
-      state.graftPath.push(i);
+      activeState.graftPath.push(i);
       if (source)
-         item= detach(state, source, depth);
+         item= detach(source, depth);
       else {
-         item= make(state);
+         item= make();
          item.value= null;
          item.owned= true;
       }
-      state.graftPath[state.graftPath.length - 1]= i + 1;
+      activeState.graftPath[activeState.graftPath.length - 1]= i + 1;
       if (target) {
          key= target.keys[target.keys.length - 1];
-         if (typeof key === "number" && !integer(key)) {
-            if (state.dates && target.tree === state.tree)
-               item.value= exportDates(state, item.value, depth);
-            parent= edit(state, parentReference(state, target), depth, true, key);
-            info= pending(state, parent.value, parent.mark);
-            if (item.element && !acceptElement(state, info, item.element))
+         if (isNumber(key) && !integer(key)) {
+            if (activeState.dates && target.tree === activeState.tree)
+               item.value= exportDates(item.value, depth);
+            parent= edit(parentReference(target), depth, true, key);
+            info= pending(parent.value, parent.mark);
+            if (item.element && !acceptElement(info, item.element))
                item.element= null;
             queue= get(info.inserts, "$" + key);
             if (!queue) {
-               queue= make(state, true);
-               put(state, info.inserts, "$" + key, queue);
+               queue= make(true);
+               put(info.inserts, "$" + key, queue);
             }
-            charge(state, 1, 8);
+            charge(1, 8);
             queue.push(item);
          } else
-            write(state, target, item.value, depth, item.owned, item.element);
+            write(target, item.value, depth, item.owned, item.element);
       }
-      state.graftPath.pop();
+      activeState.graftPath.pop();
    }
    // A temporarily detached current node must be restored before returning.
-   read(state, scope.node, depth);
-   charge(state, state.moving.length);
-   for (i= 0; i < state.moving.length; i++)
-      finishMove(state, state.moving[i], depth);
-   state.moving= null;
+   read(scope.node, depth);
+   charge(activeState.moving.length);
+   for (i= 0; i < activeState.moving.length; i++)
+      finishMove(activeState.moving[i], depth);
+   activeState.moving= null;
 }
 
 // Element metadata only accompanies direct references. Primitive strings need
 // this parallel annotation because strings cannot carry an origin themselves.
-function elementAt(state, array, key) {
-   var info= type(array) === "array"? arrayInfo(state, array) : null, result;
+function elementAt(array, key) {
+   var info= isArray(array)? arrayInfo(array) : null, result;
    if (!info || !info.split || !info.split.items[key])
       return null;
-   result= make(state);
+   result= make();
    result.origin= info.split.origin;
    result.item= info.split.items[key];
    return result;
 }
 
-function referenceElement(state, reference, depth) {
-   return reference.keys.length? elementAt(state,
-      read(state, parentReference(state, reference), depth), reference.keys[reference.keys.length - 1]) : null;
+function referenceElement(reference, depth) {
+   return reference.keys.length? elementAt(read(parentReference(reference), depth), reference.keys[reference.keys.length - 1]) : null;
 }
 
-function entry(state, list, value, owned, element) {
-   var item= make(state);
+function entry(list, value, owned, element) {
+   var item= make();
    item.value= value;
    item.owned= owned;
    item.element= element;
-   charge(state, 1, 8);
+   charge(1, 8);
    list.push(item);
 }
 
 // Shared spans preserve child ownership; expression results instead materialize
 // each value. Both paths preserve source element metadata and reject deletions.
-function appendRange(state, entries, array, start, limit, depth, mark) {
+function appendRange(entries, array, start, limit, depth, mark) {
    var i;
-   charge(state, limit - start);
+   charge(limit - start);
    for (i= start; i < limit; i++) {
-      if (!present(state, array, i))
-         fail(state, "INVALID_TARGET", "Cannot enumerate a missing or pending-deletion element");
-      entry(state, entries, depth === null? get(array, i) : copy(state, get(array, i), depth + 1),
-         depth === null? childOwnership(mark, i) : true, elementAt(state, array, i));
+      if (!present(array, i))
+         fail(invalidTarget, "Cannot enumerate a missing or pending-deletion element");
+      entry(entries, isNull(depth)? get(array, i) : copy(get(array, i), depth + 1),
+         isNull(depth)? childOwnership(mark, i) : true, elementAt(array, i));
    }
 }
 
 // Fill metadata gaps in final array order. New values inherit the preceding
 // left trim and separator; at the start only a following separator is inherited.
-function normalizeMetadata(state, split, length) {
+function normalizeMetadata(split, length) {
    var items= split.items, previous= null, item, next, i, j;
-   charge(state, length);
+   charge(length);
    for (i= 0; i < length; i++) {
       item= items[i];
       if (!item) {
          next= null;
          if (!previous) {
-            charge(state, length - i);
+            charge(length - i);
             for (j= i + 1; j < length && !next; j++)
                next= items[j];
          }
-         item= make(state);
+         item= make();
          item.left= previous? previous.left : "";
          item.right= "";
          item.sep= previous? previous.sep : next? next.sep : split.origin.separator;
@@ -954,34 +1047,34 @@ function normalizeMetadata(state, split, length) {
    }
 }
 
-function acceptElement(state, info, element) {
+function acceptElement(info, element) {
    if (!info.split && element) {
-      info.split= make(state);
+      info.split= make();
       info.split.origin= element.origin;
-      info.split.items= make(state, true);
+      info.split.items= make(true);
    }
    return element && info.split && element.origin === info.split.origin? element.item : null;
 }
 
-function receiveElement(state, array, key, element, inserting, mark) {
-   var info= arrayInfo(state, array), split, item;
+function receiveElement(array, key, element, inserting, mark) {
+   var info= arrayInfo(array), split, item;
    if (!inserting || !element && (!info || !info.split))
       return;
-   info= info || arrayInfo(state, array, true);
-   item= acceptElement(state, info, element);
+   info= info || arrayInfo(array, true);
+   item= acceptElement(info, element);
    split= info.split;
    split.items[key]= item;
-   if (state.moving && mark)
-      pending(state, array, mark);
+   if (activeState.moving && mark)
+      pending(array, mark);
    else
-      normalizeMetadata(state, split, array.length);
+      normalizeMetadata(split, array.length);
 }
 
 // Rebuild one writable array without native splice/apply argument-count limits.
 // Ownership travels with values and metadata travels with surviving elements.
-function rebuild(state, array, mark, entries) {
-   var info= arrayInfo(state, array), origin= null, fallback= null, split, item, i;
-   charge(state, entries.length * 3, entries.length * 8);
+function rebuild(array, mark, entries) {
+   var info= arrayInfo(array), origin= null, fallback= null, split, item, i;
+   charge(entries.length * 3, entries.length * 8);
    for (i= 0; i < entries.length; i++) {
       item= entries[i].element;
       if (item) {
@@ -992,157 +1085,157 @@ function rebuild(state, array, mark, entries) {
    }
    origin= origin || fallback;
    if (origin) {
-      info= info || arrayInfo(state, array, true);
-      split= make(state);
+      info= info || arrayInfo(array, true);
+      split= make();
       split.origin= origin;
-      split.items= make(state, true);
+      split.items= make(true);
       for (i= 0; i < entries.length; i++) {
          item= entries[i].element;
          split.items.push(item && item.origin === origin? item.item : null);
       }
-      normalizeMetadata(state, split, entries.length);
+      normalizeMetadata(split, entries.length);
       info.split= split;
    } else if (info)
       info.split= null;
    for (i= 0; i < entries.length; i++) {
-      put(state, array, i, entries[i].value);
-      put(state, mark, "$" + i, entries[i].owned);
+      put(array, i, entries[i].value);
+      put(mark, "$" + i, entries[i].owned);
    }
    array.length= entries.length;
 }
 
-function finishMove(state, info, depth) {
-   var entries= make(state, true), array= info.array, queue, i, j;
-   charge(state, array.length + 1, 0, 0, depth);
+function finishMove(info, depth) {
+   var entries= make(true), array= info.array, queue, i, j;
+   charge(array.length + 1, 0, 0, depth);
    for (i= 0; i <= array.length; i++) {
       queue= get(info.inserts, "$" + (i - 0.5));
       if (queue) {
-         charge(state, queue.length, queue.length * 8);
+         charge(queue.length, queue.length * 8);
          for (j= 0; j < queue.length; j++)
             entries.push(queue[j]);
       }
       if (i < array.length && !get(info.deleted, "$" + i))
-         entry(state, entries, get(array, i), childOwnership(info.mark, i), elementAt(state, array, i));
+         entry(entries, get(array, i), childOwnership(info.mark, i), elementAt(array, i));
    }
    info.deleted= null;
    info.inserts= null;
-   rebuild(state, array, info.mark, entries);
+   rebuild(array, info.mark, entries);
 }
 
-function splice(state, expression, scope, depth) {
+function splice(expression, scope, depth) {
    var reference, parent, array, offset, count, replacements, entries, i;
-   arity(state, expression, 3, Infinity);
-   reference= argument(state, expression, 1, scope, depth, path, true);
+   arity(expression, 3, Infinity);
+   reference= argument(expression, 1, scope, depth, path, true);
    if (!reference.keys.length)
-      fail(state, "INVALID_TARGET", "SPLICE requires an array element path");
-   parent= parentReference(state, reference);
-   array= read(state, parent, depth);
-   if (type(array) !== "array")
-      fail(state, "INVALID_TARGET", "SPLICE requires an array");
-   offset= selector(state, array, reference.keys[reference.keys.length - 1], true);
-   count= argument(state, expression, 2, scope, depth);
-   if (count !== null && !integer(count))
-      fail(state, "INVALID_OPERAND", "SPLICE count must be an integer or null");
-   count= count === null? array.length - offset : count < 0? array.length + count - offset : count;
+      fail(invalidTarget, "SPLICE requires an array element path");
+   parent= parentReference(reference);
+   array= read(parent, depth);
+   if (!isArray(array))
+      fail(invalidTarget, "SPLICE requires an array");
+   offset= selector(array, reference.keys[reference.keys.length - 1], true);
+   count= argument(expression, 2, scope, depth);
+   if (!isNull(count) && !integer(count))
+      fail(invalidOperand, "SPLICE count must be an integer or null");
+   count= isNull(count)? array.length - offset : count < 0? array.length + count - offset : count;
    if (count < 0 || count > array.length - offset)
-      fail(state, "INVALID_TARGET", "SPLICE removal range is out of bounds");
-   replacements= make(state, true);
-   charge(state, expression.length);
+      fail(invalidTarget, "SPLICE removal range is out of bounds");
+   replacements= make(true);
+   charge(expression.length);
    for (i= 3; i < expression.length; i++) {
-      entries= argument(state, expression, i, scope, depth);
-      if (state.dates && reference.tree === state.tree)
-         entries= exportDates(state, entries, depth);
-      entry(state, replacements, entries, true, state.element);
+      entries= argument(expression, i, scope, depth);
+      if (activeState.dates && reference.tree === activeState.tree)
+         entries= exportDates(entries, depth);
+      entry(replacements, entries, true, activeState.element);
    }
    // Every replacement was captured before cloning or altering the array.
    if (!count && !replacements.length)
       return;
-   parent= edit(state, parent, depth, false);
+   parent= edit(parent, depth, false);
    array= parent.value;
-   entries= make(state, true);
-   charge(state, array.length + replacements.length, replacements.length * 8);
-   appendRange(state, entries, array, 0, offset, null, parent.mark);
+   entries= make(true);
+   charge(array.length + replacements.length, replacements.length * 8);
+   appendRange(entries, array, 0, offset, null, parent.mark);
    for (i= 0; i < replacements.length; i++)
       entries.push(replacements[i]);
-   appendRange(state, entries, array, offset + count, array.length, null, parent.mark);
-   rebuild(state, array, parent.mark, entries);
+   appendRange(entries, array, offset + count, array.length, null, parent.mark);
+   rebuild(array, parent.mark, entries);
 }
 
 // Construct literal objects/escaped arrays recursively. Referenced values are
 // materialized, so subsequent writes cannot create aliases or cycles.
-function construct(state, source, scope, depth) {
-   return copy(state, source, depth, false, scope);
+function construct(source, scope, depth) {
+   return copy(source, depth, false, scope);
 }
 
 // A direct reference can carry one element's SPLIT metadata. Derived functions
 // deliberately clear it; array metadata instead lives in the identity table.
-function evaluate(state, expression, scope, depth, borrowed) {
-   var captures= state.captures, result, id;
+function evaluate(expression, scope, depth, borrowed) {
+   var captures= activeState.captures, result, id;
    // Function expressions start independent matches, including beneath a
    // capture-suppressing ANY/NONE/REP. Restore the caller even on probe errors.
-   state.captures= null;
+   activeState.captures= null;
    try {
-      result= evaluateValue(state, expression, scope, depth, borrowed);
+      result= evaluateValue(expression, scope, depth, borrowed);
    } finally {
-      state.captures= captures;
+      activeState.captures= captures;
    }
-   id= type(expression) === "array"? get(expression, 0) : undefined;
-   id= typeof id === "string"? get(expressions, id) : id;
-   if (typeof id !== "number" || id < -5 || id > 0)
-      state.element= null;
+   id= isArray(expression)? get(expression, 0) : undefined;
+   id= isString(id)? get(expressions, id) : id;
+   if (!isNumber(id) || id < EXPR || id > HAS - 1)
+      activeState.element= null;
    return result;
 }
 
 // Internal consumers such as LENGTH and SLICE may inspect a reference without
 // enumerating it. In particular LENGTH remains legal during pending deletions.
-function borrow(state, expression, scope, depth) {
-   return evaluate(state, expression, scope, depth, true);
+function borrow(expression, scope, depth) {
+   return evaluate(expression, scope, depth, true);
 }
 
 // A temporary current node borrows its value. Expressions cannot mutate it,
 // and writes to data subsequently returned by an expression still copy it.
-function valueScope(state, scope, value) {
-   var result= scopeCopy(state, scope);
+function valueScope(scope, value) {
+   var result= scopeCopy(scope);
    result.regex= null;
-   result.node= make(state);
-   result.node.tree= holder(state, value, false);
-   result.node.keys= make(state, true);
+   result.node= make();
+   result.node.tree= holder(value, false);
+   result.node.keys= make(true);
    return result;
 }
 
 // Position is independent of value existence. Regex cursors use a virtual
 // one-slot array, so report their logical codepoint index directly instead.
-function currentProperty(state, scope, depth) {
+function currentProperty(scope, depth) {
    var keys= scope.node.keys, parent, key, kind;
    if (scope.regex) return scope.regex.position;
    if (!keys.length) return null;
    key= keys[keys.length - 1];
-   parent= read(state, parentReference(state, scope.node), depth);
+   parent= read(parentReference(scope.node), depth);
    kind= type(parent);
-   if (kind === "array") return key === false? parent.length : key < 0? parent.length + key : key;
-   return kind === "object" || kind === "date"? key : null;
+   if (kind === TYPE_ARRAY) return key === false? parent.length : key < 0? parent.length + key : key;
+   return kind === TYPE_OBJECT || kind === TYPE_DATE? key : null;
 }
 
 // LOCAL evaluates binding names and can rebind NODE with null. WITH accepts
 // only literal string/integer TEMP names. Both assign sequentially into a
 // private shallow TEMP root, leaving caller holders and nested data untouched.
-function bindingScope(state, expression, scope, depth, local) {
+function bindingScope(expression, scope, depth, local) {
    var result, name, value, i;
    if (expression.length < (local? 2 : 4) || expression.length % 2)
-      fail(state, "INVALID_GRAFT", "Expected binding pairs and a final expression");
-   result= scopeCopy(state, scope);
-   result.temp= holder(state, copy(state, scope.temp.value, depth, true), true);
-   charge(state, expression.length);
+      fail(invalidGraft, "Expected binding pairs and a final expression");
+   result= scopeCopy(scope);
+   result.temp= holder(copy(scope.temp.value, depth, true), true);
+   charge(expression.length);
    for (i= 1; i < expression.length - 1; i+= 2) {
-      name= local? argument(state, expression, i, result, depth) : get(expression, i);
-      if (!(local && name === null) && typeof name !== "string"
-            && !(local? typeof name === "number" : integer(name)))
-         fail(state, local? "INVALID_OPERAND" : "INVALID_GRAFT", "Invalid lexical binding name");
-      value= argument(state, expression, i + 1, result, depth);
-      if (name === null)
-         result= valueScope(state, result, value);
+      name= local? argument(expression, i, result, depth) : get(expression, i);
+      if (!(local && isNull(name)) && !isString(name)
+            && !(local? isNumber(name) : integer(name)))
+         fail(local? invalidOperand : invalidGraft, "Invalid lexical binding name");
+      value= argument(expression, i + 1, result, depth);
+      if (isNull(name))
+         result= valueScope(result, value);
       else
-         put(state, result.temp.value, String(name), value);
+         put(result.temp.value, String(name), value);
    }
    return result;
 }
@@ -1153,98 +1246,98 @@ function bindingScope(state, expression, scope, depth, local) {
 // element bypasses regex entry when a cursor is already positioned; 2
 // dispatches a successor-set probe rather than a boolean match. Inner
 // function matches retain regex context, but restore the calling character.
-function match(state, expression, scope, depth, mode, target, element) {
-   var pathLength= state.graftPath.length, inputPath= state.inputPath;
+function match(expression, scope, depth, mode, target, element) {
+   var pathLength= activeState.graftPath.length, inputPath= activeState.inputPath;
    var regex= !element && !target && scope.regex, position= regex && regex.position, result;
-   var captures= state.captures;
+   var captures= activeState.captures;
    try {
       if (element === 2)
-         return sequenceValue(state, expression, scope, depth, mode, target);
+         return sequenceValue(expression, scope, depth, mode, target);
       if (regex) {
-         result= sequenceTerm(state, expression, scope, depth,
+         result= sequenceTerm(expression, scope, depth,
             position * 32 + 16 + (mode || 0), regex);
-         sequencePosition(state, regex, position);
-         return sequenceResolve(state, result, regex, 0);
+         sequencePosition(regex, position);
+         return sequenceResolve(result, regex, 0);
       }
-      result= matchValue(state, expression, scope, depth, mode || 0, target);
-      if (!result) state.captures= captures;
+      result= matchValue(expression, scope, depth, mode || 0, target);
+      if (!result) activeState.captures= captures;
       return result;
    } catch (error) {
-      state.captures= captures;
-      if (!error || error.counts !== state.counts
-            || error.code !== "INVALID_TARGET" && error.code !== "INVALID_OPERAND")
+      activeState.captures= captures;
+      if (!error || error.counts !== activeState.counts
+            || error.code !== invalidTarget && error.code !== invalidOperand)
          throw error;
-      state.graftPath.length= pathLength;
-      state.inputPath= inputPath;
-      state.element= null;
+      activeState.graftPath.length= pathLength;
+      activeState.inputPath= inputPath;
+      activeState.element= null;
       if (regex)
-         sequencePosition(state, regex, position);
+         sequencePosition(regex, position);
       return element === 2? -1 : false;
    }
 }
 
-function matchWithoutCaptures(state, expression, scope, depth, mode) {
-   var captures= state.captures;
-   state.captures= null;
+function matchWithoutCaptures(expression, scope, depth, mode) {
+   var captures= activeState.captures;
+   activeState.captures= null;
    try {
-      return match(state, expression, scope, depth, mode);
+      return match(expression, scope, depth, mode);
    } finally {
-      state.captures= captures;
+      activeState.captures= captures;
    }
 }
 
 // Observable matches keep immutable annotation chains. Alternatives can share
 // prefixes, while failed probes simply restore the previous chain. Functions
 // and actions start new chains; only their resulting capture objects escape.
-function captureMatch(state, expression, scope, depth) {
-   var previous= state.captures, trace= make(state), result, event;
+function captureMatch(expression, scope, depth) {
+   var previous= activeState.captures, trace= make(), result, event;
    trace.root= scope.node;
    trace.count= 0;
-   state.captures= trace;
+   activeState.captures= trace;
    try {
-      if (!match(state, expression, scope, depth)) return false;
-      result= make(state);
-      for (trace= state.captures; trace.previous; trace= trace.previous) {
-         charge(state, 1);
+      if (!match(expression, scope, depth)) return false;
+      result= make();
+      for (trace= activeState.captures; trace.previous; trace= trace.previous) {
+         charge(1);
          event= trace.event;
-         if (event.name !== undefined && event.name !== null)
-            put(state, result, event.name, event.range);
+         if (event.name !== undefined && !isNull(event.name))
+            put(result, event.name, event.range);
       }
       return result;
    } finally {
-      state.captures= previous;
+      activeState.captures= previous;
    }
 }
 
 // Append one rank/capture, enforcing name uniqueness against the entire match.
-function captureAppend(state, trace, event) {
+function captureAppend(trace, event) {
    var previous= trace, result;
-   if (event.name !== undefined && event.name !== null) {
-      property(state, event.name);
+   if (event.name !== undefined && !isNull(event.name)) {
+      property(event.name);
       while (previous.previous) {
-         charge(state, 1);
+         charge(1);
          if (previous.event.name === event.name)
-            fail(state, "INVALID_OPERAND", "Duplicate capture name");
+            fail(invalidOperand, "Duplicate capture name");
          previous= previous.previous;
       }
    }
-   result= make(state);
+   result= make();
    result.previous= trace;
    result.event= event;
    result.root= trace.root;
-   result.count= trace.count + (event.name !== undefined && event.name !== null? 1 : 0);
+   result.count= trace.count + (event.name !== undefined && !isNull(event.name)? 1 : 0);
    return result;
 }
 
 // Ranks for deeper arrays have already been resolved. At this array compare
 // all named-group lengths first, then starts, then substructure placements.
-function captureRanks(state, trace, cursor, groups) {
-   var result= make(state, true), event;
+function captureRanks(trace, cursor, groups) {
+   var result= make(true), event;
    while (trace && trace.previous) {
-      charge(state, 1);
+      charge(1);
       event= trace.event;
       if (event.cursor === cursor && (event.group !== undefined) === groups) {
-         charge(state, 0, 8);
+         charge(0, 8);
          result.push(event);
       }
       trace= trace.previous;
@@ -1252,14 +1345,14 @@ function captureRanks(state, trace, cursor, groups) {
    return result;
 }
 
-function captureBetter(state, left, right, cursor) {
+function captureBetter(left, right, cursor) {
    var a, b, i, pass, x, y;
    if (!left || left === right) return false;
    if (!right) return true;
    for (pass= 0; pass < 3; pass++) {
-      a= captureRanks(state, left, cursor, pass < 2);
-      b= captureRanks(state, right, cursor, pass < 2);
-      charge(state, a.length + b.length);
+      a= captureRanks(left, cursor, pass < 2);
+      b= captureRanks(right, cursor, pass < 2);
+      charge(a.length + b.length);
       for (i= 1; i <= a.length && i <= b.length; i++) {
          x= a[a.length - i];
          y= b[b.length - i];
@@ -1273,44 +1366,44 @@ function captureBetter(state, left, right, cursor) {
 }
 
 function sequenceTrace(positions, position, fallback) {
-   var trace= typeof positions !== "number" && positions["$" + position];
+   var trace= !isNumber(positions) && positions["$" + position];
    return trace && trace !== true? trace : fallback;
 }
 
 // Select a complete array match without discarding its annotations. An exact
 // match accepts the boundary (including predicates on the missing end node).
-function sequenceResolve(state, positions, cursor, minimum) {
+function sequenceResolve(positions, cursor, minimum) {
    var i, position, trace, best= null, found= false;
-   var count= typeof positions === "number"? 1 : positions.length;
-   charge(state, count);
+   var count= isNumber(positions)? 1 : positions.length;
+   charge(count);
    for (i= 0; i < count; i++) {
-      position= typeof positions === "number"? positions : positions[i];
+      position= isNumber(positions)? positions : positions[i];
       if (position >= minimum) {
-         trace= sequenceTrace(positions, position, state.captures);
-         if (!found || captureBetter(state, trace, best, cursor)) best= trace;
+         trace= sequenceTrace(positions, position, activeState.captures);
+         if (!found || captureBetter(trace, best, cursor)) best= trace;
          found= true;
       }
    }
-   if (found) state.captures= best;
+   if (found) activeState.captures= best;
    return found;
 }
 
 // A sequence cursor borrows an array location or a string index. Its element
 // scope is reused; a virtual one-slot array makes end-of-string genuinely
 // missing (including for EXISTS and references), without decoding an array.
-function sequenceCursor(state, scope, value) {
-   var cursor= make(state);
+function sequenceCursor(scope, value) {
+   var cursor= make();
    cursor.node= scope.node;
-   cursor.scope= scopeCopy(state, scope);
-   cursor.scope.node= make(state);
-   cursor.info= typeof value === "string"? stringInfo(state, value) : null;
+   cursor.scope= scopeCopy(scope);
+   cursor.scope.node= make();
+   cursor.info= isString(value)? stringInfo(value) : null;
    cursor.start= 0;
    cursor.length= null;
-   cursor.value= cursor.info? make(state, true) : value;
+   cursor.value= cursor.info? make(true) : value;
    if (cursor.info)
       cursor.scope.regex= cursor;
-   cursor.scope.node.tree= cursor.info? holder(state, cursor.value, false) : scope.node.tree;
-   charge(state, scope.node.keys.length, 32 + scope.node.keys.length * 8, 1);
+   cursor.scope.node.tree= cursor.info? holder(cursor.value, false) : scope.node.tree;
+   charge(scope.node.keys.length, 32 + scope.node.keys.length * 8, 1);
    cursor.scope.node.keys= cursor.info? [] : scope.node.keys.slice(0);
    cursor.scope.node.keys.push(0);
    return cursor;
@@ -1318,17 +1411,17 @@ function sequenceCursor(state, scope, value) {
 
 // Position one cursor without allocating per-element scopes. Return whether
 // the position is at the end; indices beyond it cannot generate successors.
-function sequencePosition(state, cursor, position) {
+function sequencePosition(cursor, position) {
    var offset;
-   charge(state, 1);
+   charge(1);
    cursor.position= position;
    if (cursor.info) {
-      offset= stringOffset(state, cursor.info, cursor.start + position);
-      if (offset < cursor.info.text.length && (cursor.length === null || position < cursor.length))
+      offset= stringOffset(cursor.info, cursor.start + position);
+      if (offset < cursor.info.text.length && (isNull(cursor.length) || position < cursor.length))
          cursor.value[0]= character(cursor.info, offset);
       else if (owns(cursor.value, 0))
          delete cursor.value[0];
-      return offset >= cursor.info.text.length || cursor.length !== null && position >= cursor.length;
+      return offset >= cursor.info.text.length || !isNull(cursor.length) && position >= cursor.length;
    }
    cursor.scope.node.keys[cursor.scope.node.keys.length - 1]= position;
    return position >= cursor.value.length;
@@ -1336,10 +1429,10 @@ function sequencePosition(state, cursor, position) {
 
 // String views share the original index/checkpoints, but anchors, missing-node
 // probes, literals, and repetition must respect the view's logical boundaries.
-function sequenceLength(state, cursor, complete) {
+function sequenceLength(cursor, complete) {
    if (!cursor.info) return cursor.value.length;
-   if (cursor.length !== null) return cursor.length;
-   if (complete && cursor.info.length === null) stringOffset(state, cursor.info, Infinity);
+   if (!isNull(cursor.length)) return cursor.length;
+   if (complete && isNull(cursor.info.length)) stringOffset(cursor.info, Infinity);
    return cursor.info.length;
 }
 
@@ -1347,50 +1440,50 @@ function sequenceLength(state, cursor, complete) {
 // internal array with prefixed membership keys holding true or annotations.
 // Unannotated deterministic paths allocate nothing; branching sets grow once
 // per distinct position, resolving annotation ties without sorting.
-function sequenceAdd(state, result, position, trace, cursor) {
+function sequenceAdd(result, position, trace, cursor) {
    var previous, key;
    trace= trace && trace.previous? trace : null;
    if (position < 0 || result === position && !trace)
       return result;
    if (result === -1 && !trace)
       return position;
-   if (typeof result === "number") {
+   if (isNumber(result)) {
       previous= result;
-      result= make(state, true);
-      if (previous !== -1) result= sequenceAdd(state, result, previous);
+      result= make(true);
+      if (previous !== -1) result= sequenceAdd(result, previous);
    }
    key= "$" + position;
-   charge(state, 1);
+   charge(1);
    if (!owns(result, key)) {
-      charge(state, 1, 16 + key.length * 2);
+      charge(1, 16 + key.length * 2);
       result[key]= trace || true;
       result.push(position);
-   } else if (trace && captureBetter(state, trace, result[key] === true? null : result[key], cursor))
+   } else if (trace && captureBetter(trace, result[key] === true? null : result[key], cursor))
       result[key]= trace;
    return result;
 }
 
 // Merge (and optionally filter) successor sets without sharing a mutable set.
-function sequenceMerge(state, result, source, minimum, maximum, cursor) {
-   var i, position, count= typeof source === "number"? 1 : source.length;
-   charge(state, count);
+function sequenceMerge(result, source, minimum, maximum, cursor) {
+   var i, position, count= isNumber(source)? 1 : source.length;
+   charge(count);
    for (i= 0; i < count; i++) {
-      position= typeof source === "number"? source : source[i];
+      position= isNumber(source)? source : source[i];
       if (position >= minimum && position <= maximum)
-         result= sequenceAdd(state, result, position, sequenceTrace(source, position, null), cursor);
+         result= sequenceAdd(result, position, sequenceTrace(source, position, null), cursor);
    }
    return result;
 }
 
 // Repetition can stop at a fixed point, including zero-width matches below a
 // very large minimum. Membership makes equality independent of traversal order.
-function sequenceSame(state, left, right) {
+function sequenceSame(left, right) {
    var i;
-   if (typeof left === "number" || typeof right === "number")
+   if (isNumber(left) || isNumber(right))
       return left === right;
    if (left.length !== right.length)
       return false;
-   charge(state, left.length);
+   charge(left.length);
    for (i= 0; i < left.length; i++)
       if (!owns(right, "$" + left[i]))
          return false;
@@ -1399,228 +1492,228 @@ function sequenceSame(state, left, right) {
 
 // Apply one child to every frontier position. A singleton avoids allocation
 // and merging altogether. argument retains the child's diagnostic location.
-function sequenceApply(state, expression, key, scope, depth, options, cursor, positions) {
-   var i, result= -1, captures= state.captures;
-   if (typeof positions === "number")
-      return positions === -1? -1 : argument(state, expression, key, scope, depth,
+function sequenceApply(expression, key, scope, depth, options, cursor, positions) {
+   var i, result= -1, captures= activeState.captures;
+   if (isNumber(positions))
+      return positions === -1? -1 : argument(expression, key, scope, depth,
          sequenceTerm, positions * 32 + options, cursor);
-   charge(state, positions.length);
+   charge(positions.length);
    for (i= 0; i < positions.length; i++) {
-      state.captures= sequenceTrace(positions, positions[i], captures);
-      result= sequenceMerge(state, result, argument(state, expression, key, scope, depth,
+      activeState.captures= sequenceTrace(positions, positions[i], captures);
+      result= sequenceMerge(result, argument(expression, key, scope, depth,
          sequenceTerm, positions[i] * 32 + options, cursor), 0, Infinity, cursor);
    }
-   state.captures= captures;
+   activeState.captures= captures;
    return result;
 }
 
 // Use the ordinary probe-error boundary for every branch. INVALID_TARGET and
 // INVALID_OPERAND eliminate only this term's successors; fatal errors escape.
-function sequenceTerm(state, expression, scope, depth, options, cursor) {
-   var captures= state.captures, result, trace, i;
+function sequenceTerm(expression, scope, depth, options, cursor) {
+   var captures= activeState.captures, result, trace, i;
    try {
-      result= match(state, expression, scope, depth, options, cursor, 2);
-      if (typeof result === "number" && result !== -1)
-         result= sequenceAdd(state, -1, result, state.captures || captures, cursor);
-      else if (typeof result !== "number") {
-         trace= state.captures || captures;
+      result= match(expression, scope, depth, options, cursor, 2);
+      if (isNumber(result) && result !== -1)
+         result= sequenceAdd(-1, result, activeState.captures || captures, cursor);
+      else if (!isNumber(result)) {
+         trace= activeState.captures || captures;
          if (trace && trace.previous) {
-            charge(state, result.length);
+            charge(result.length);
             for (i= 0; i < result.length; i++)
                if (result["$" + result[i]] === true) result["$" + result[i]]= trace;
          }
       }
       return result;
    } finally {
-      state.captures= captures;
+      activeState.captures= captures;
    }
 }
 
 // Ordinary predicates consume one element (or zero for alternate-target
 // comparisons). Record where a capture-producing substructure was applied so
 // equal endpoint paths resolve independently of alternative traversal order.
-function sequenceElement(state, expression, scope, depth, mode, cursor, position, width) {
-   var captures= state.captures, event;
-   if (!match(state, expression, scope, depth, mode, null, true)) return -1;
-   if (captures && state.captures.count > captures.count) {
-      event= make(state);
+function sequenceElement(expression, scope, depth, mode, cursor, position, width) {
+   var captures= activeState.captures, event;
+   if (!match(expression, scope, depth, mode, null, true)) return -1;
+   if (captures && activeState.captures.count > captures.count) {
+      event= make();
       event.cursor= cursor;
       event.position= position;
-      state.captures= captureAppend(state, state.captures, event);
+      activeState.captures= captureAppend(activeState.captures, event);
    }
    return position + width;
 }
 
 // Generate successors for one term. options packs its starting position above
 // four matching bits and the active-sequence bit, avoiding per-position objects.
-function sequenceValue(state, expression, scope, depth, options, cursor) {
+function sequenceValue(expression, scope, depth, options, cursor) {
    var position= Math.floor(options / 32), mode= options & 15, kind= type(expression);
    var id= null, next, offset, end, info, i, result, minimum, maximum, count, frontier, branches;
-   var captures= state.captures;
-   charge(state, 1, 0, 0, depth);
-   end= sequencePosition(state, cursor, position);
+   var captures= activeState.captures;
+   charge(1, 0, 0, depth);
+   end= sequencePosition(cursor, position);
    scope= cursor.scope;
-   offset= sequenceLength(state, cursor);
-   if (offset !== null && position > offset)
+   offset= sequenceLength(cursor);
+   if (!isNull(offset) && position > offset)
       return -1;
    if (!(mode & 2)) {
-      id= kind === "array" && !(expression.length === 1 && type(get(expression, 0)) === "array")
-         ? operation(state, expression, expressions) : null;
-      if (id === -5)
-         return sequenceTerm(state, macro(state, expression, scope, depth), scope, depth + 1,
+      id= kind === TYPE_ARRAY && !(expression.length === 1 && isArray(get(expression, 0)))
+         ? operation(expression, expressions) : null;
+      if (id === EXPR)
+         return sequenceTerm(macro(expression, scope, depth), scope, depth + 1,
             position * 32 + (mode | 4) + (options & 16), cursor);
-      if (id === 12) {
-         next= bindingScope(state, expression, scope, depth, false);
+      if (id === WITH) {
+         next= bindingScope(expression, scope, depth, false);
          cursor.scope= next;
          try {
-            return argument(state, expression, expression.length - 1, next, depth, sequenceTerm,
+            return argument(expression, expression.length - 1, next, depth, sequenceTerm,
                position * 32 + (mode & 1) + (options & 16), cursor);
          } finally {
             cursor.scope= scope;
          }
       }
-      if (id >= 13 && id <= 15) {
-         arity(state, expression, id === 13? 1 : 2, Infinity);
-         if (id !== 13 && options & 16)
-            fail(state, "INVALID_GRAFT", "Named sequences require an array specification root");
-         result= sequenceTerms(state, expression, scope, depth,
-            position * 32 + 16 + (mode & 1), cursor, id === 13? 1 : 2);
-         return id === 13 || !captures? result
-            : sequenceCapture(state, result, cursor, position);
+      if (id > SEQ - 1 && id < SEQMIN + 1) { // SEQ=13, SEQMAX=14, SEQMIN=15
+         arity(expression, id < SEQ + 1? 1 : 2, Infinity);
+         if (id > SEQMAX - 1 && options & 16)
+            fail(invalidGraft, "Named sequences require an array specification root");
+         result= sequenceTerms(expression, scope, depth,
+            position * 32 + 16 + (mode & 1), cursor, id < SEQ + 1? 1 : 2);
+         return id < SEQ + 1 || !captures? result
+            : sequenceCapture(result, cursor, position);
       }
       if (!(options & 16))
-         return sequenceElement(state, expression, scope, depth, mode, cursor, position, 1);
+         return sequenceElement(expression, scope, depth, mode, cursor, position, 1);
       options= 16 + (mode & 1);
-      if (id >= 3 && id <= 5) {
-         arity(state, expression, id === 3? 1 : 2, Infinity);
+      if (id > NONE - 1 && id < ALL + 1) { // NONE=3, ANY=4, ALL=5
+         arity(expression, id < NONE + 1? 1 : 2, Infinity);
          result= -1;
          minimum= 0;
-         if (id !== 5) state.captures= null;
-         branches= id === 5 && captures? make(state, true) : null;
-         charge(state, expression.length);
+         if (id < ANY + 1) activeState.captures= null;
+         branches= id > ALL - 1 && captures? make(true) : null;
+         charge(expression.length);
          for (i= 1; i < expression.length; i++) {
-            next= argument(state, expression, i, scope, depth, sequenceTerm,
+            next= argument(expression, i, scope, depth, sequenceTerm,
                position * 32 + options, cursor);
             if (branches) {
-               charge(state, 0, 8);
+               charge(0, 8);
                branches.push(next);
             }
-            if (id === 3 && next !== -1 || id === 5 && next === -1)
+            if (id < NONE + 1 && next !== -1 || id > ALL - 1 && next === -1)
                return -1;
-            if (id === 5) {
-               offset= typeof next === "number"? next : Infinity;
-               if (typeof next !== "number") {
-                  charge(state, next.length);
+            if (id > ALL - 1) {
+               offset= isNumber(next)? next : Infinity;
+               if (!isNumber(next)) {
+                  charge(next.length);
                   for (count= 0; count < next.length; count++)
                      offset= Math.min(offset, next[count]);
                }
                minimum= Math.max(minimum, offset);
             }
-            result= sequenceMerge(state, result, next, 0, Infinity, cursor);
+            result= sequenceMerge(result, next, 0, Infinity, cursor);
          }
-         result= id === 3? position : id === 4? result
-            : sequenceMerge(state, -1, result, minimum, Infinity, cursor);
-         return branches && result !== -1? sequenceAll(state, result, branches, captures, cursor) : result;
+         result= id < NONE + 1? position : id === ANY? result
+            : sequenceMerge(-1, result, minimum, Infinity, cursor);
+         return branches && result !== -1? sequenceAll(result, branches, captures, cursor) : result;
       }
-      if (id === 16) {
-         arity(state, expression, 4, 4);
-         minimum= argument(state, expression, 1, scope, depth, borrow);
-         maximum= argument(state, expression, 2, scope, depth, borrow);
+      if (id === REP) {
+         arity(expression, 4, 4);
+         minimum= argument(expression, 1, scope, depth, borrow);
+         maximum= argument(expression, 2, scope, depth, borrow);
          if (!integer(minimum) || minimum < 0 || !integer(maximum) || maximum < -1
                || maximum > 0 && maximum < minimum)
-            fail(state, "INVALID_OPERAND", "Invalid repetition bounds");
+            fail(invalidOperand, "Invalid repetition bounds");
          maximum= maximum === -1? Infinity : maximum || minimum;
-         state.captures= null;
-         end= sequenceLength(state, cursor, true);
+         activeState.captures= null;
+         end= sequenceLength(cursor, true);
          result= minimum === 0? position : -1;
          frontier= position;
          count= 0;
          while (frontier !== -1 && count < maximum) {
-            charge(state, 1);
-            next= sequenceMerge(state, -1, sequenceApply(state, expression, 3,
+            charge(1);
+            next= sequenceMerge(-1, sequenceApply(expression, 3,
                scope, depth, options, cursor, frontier), 0, end);
             count++;
-            if (sequenceSame(state, frontier, next))
-               return sequenceMerge(state, result, next, 0, end);
+            if (sequenceSame(frontier, next))
+               return sequenceMerge(result, next, 0, end);
             if (count >= minimum)
-               result= sequenceMerge(state, result, next, 0, end);
+               result= sequenceMerge(result, next, 0, end);
             frontier= next;
          }
          return result;
       }
       // A virtual string element exists exactly before the boundary; probing
       // it needs no path walk or per-character diagnostic array.
-      if (id === 17 || id === 18 || cursor.info && id === 6) {
-         arity(state, expression, 1, 1);
-         return id === 6? end? -1 : position + 1
-            : (id === 17? position === 0 : end)? position : -1;
+      if (id > START - 1 && id < END + 1 || cursor.info && id === EXISTS) { // START=17, END=18, virtual EXISTS=6
+         arity(expression, 1, 1);
+         return id === EXISTS? end? -1 : position + 1
+            : (id < START + 1? position === 0 : end)? position : -1;
       }
       // A one-argument comparison probes with the current sequence context but
       // consumes exactly one element. Alternate-target comparisons are assertions.
-      if (id === 1 || id === 2) {
-         arity(state, expression, 2, 3);
+      if (id > HAS - 1 && id < IS + 1) { // HAS=1, IS=2
+         arity(expression, 2, 3);
          if (expression.length === 2) {
-            result= argument(state, expression, 1, scope, depth, sequenceTerm,
-               position * 32 + 16 + (id === 2? 1 : 0), cursor);
-            return sequenceResolve(state, result, cursor, 0)? position + 1 : -1;
+            result= argument(expression, 1, scope, depth, sequenceTerm,
+               position * 32 + 16 + (id > IS - 1? 1 : 0), cursor);
+            return sequenceResolve(result, cursor, 0)? position + 1 : -1;
          }
-         return sequenceElement(state, expression, scope, depth, mode, cursor, position, 0);
+         return sequenceElement(expression, scope, depth, mode, cursor, position, 0);
       }
-      if (cursor.info && (id === null || id < 1 || id > 19 || mode & 4 && (id < 6 || id > 12 && id !== 19))) {
-         if (id !== null || mode & 4) {
-            expression= borrow(state, expression, scope, depth + 1);
+      if (cursor.info && (isNull(id) || id < NODE + 1 || id > CHARS || mode & 4 && (id < ALL + 1 || id > SEQ - 1 && id !== CHARS))) {
+         if (!isNull(id) || mode & 4) {
+            expression= borrow(expression, scope, depth + 1);
             kind= type(expression);
          }
          id= null;
       }
    }
-   if (cursor.info && (mode & 2 || id === null)) {
-      if (kind === "string") {
-         offset= stringOffset(state, cursor.info, cursor.start + position);
+   if (cursor.info && (mode & 2 || isNull(id))) {
+      if (kind === TYPE_STRING) {
+         offset= stringOffset(cursor.info, cursor.start + position);
          next= offset + expression.length;
-         charge(state, expression.length + 1);
+         charge(expression.length + 1);
          if (stringSlice.call(cursor.info.text, offset, next) !== expression
                || !stringBoundary(cursor.info.text, next, !!cursor.info.checkpoints))
             return -1;
-         info= stringInfo(state, expression);
-         stringOffset(state, info, Infinity);
-         if (cursor.length !== null && position + info.length > cursor.length) return -1;
+         info= stringInfo(expression);
+         stringOffset(info, Infinity);
+         if (!isNull(cursor.length) && position + info.length > cursor.length) return -1;
          return position + info.length;
       }
-      return !end && kind === "number" && expression === cursor.value[0]? position + 1 : -1;
+      return !end && kind === TYPE_NUMBER && expression === cursor.value[0]? position + 1 : -1;
    }
-   return sequenceElement(state, expression, scope, depth, mode, cursor, position, 1);
+   return sequenceElement(expression, scope, depth, mode, cursor, position, 1);
 }
 
 // Evaluate root sequence names from start before matching, with NODE missing.
 // Suppressed/boolean matches never evaluate names or allocate descriptors.
-function sequenceGroups(state, expression, scope, depth, start) {
+function sequenceGroups(expression, scope, depth, start) {
    var i, term, id, level, groups= null, local, group, name;
-   charge(state, expression.length);
+   charge(expression.length);
    for (i= start || 0; i < expression.length; i++) {
       term= get(expression, i);
       level= depth;
       do {
-         charge(state, 1, 0, 0, ++level);
-         id= type(term) === "array" && !(term.length === 1 && type(get(term, 0)) === "array")
-            ? operation(state, term, expressions) : null;
-         if (id === -5) term= macro(state, term, scope, level);
-      } while (id === -5);
-      if (id === 14 || id === 15) {
-         arity(state, term, 2, Infinity);
+         charge(1, 0, 0, ++level);
+         id= isArray(term) && !(term.length === 1 && isArray(get(term, 0)))
+            ? operation(term, expressions) : null;
+         if (id === EXPR) term= macro(term, scope, level);
+      } while (id === EXPR);
+      if (id > SEQMAX - 1 && id < SEQMIN + 1) { // SEQMAX=14, SEQMIN=15
+         arity(term, 2, Infinity);
          if (!groups) {
-            groups= make(state);
-            local= valueScope(state, scope, make(state));
+            groups= make();
+            local= valueScope(scope, make());
             local.node.keys.push(0);
          }
-         state.graftPath.push(i);
-         name= argument(state, term, 1, local, level, borrow);
-         state.graftPath.pop();
-         if (name !== null && typeof name !== "string" && !integer(name))
-            fail(state, "INVALID_OPERAND", "Invalid capture name");
-         group= make(state);
-         group.name= name === null? null : String(name);
-         group.maximum= id === 14;
+         activeState.graftPath.push(i);
+         name= argument(term, 1, local, level, borrow);
+         activeState.graftPath.pop();
+         if (!isNull(name) && !isString(name) && !integer(name))
+            fail(invalidOperand, "Invalid capture name");
+         group= make();
+         group.name= isNull(name)? null : String(name);
+         group.maximum= id < SEQMAX + 1;
          groups["$" + i]= group;
       }
    }
@@ -1628,62 +1721,62 @@ function sequenceGroups(state, expression, scope, depth, start) {
 }
 
 // Annotate every endpoint of a root named sequence, retaining inner captures.
-function sequenceCapture(state, positions, cursor, start) {
-   var count= typeof positions === "number"? 1 : positions.length, i, end, event, range, trace;
-   var group= cursor.groups["$" + cursor.group], result= -1, root= state.captures.root;
-   charge(state, count);
+function sequenceCapture(positions, cursor, start) {
+   var count= isNumber(positions)? 1 : positions.length, i, end, event, range, trace;
+   var group= cursor.groups["$" + cursor.group], result= -1, root= activeState.captures.root;
+   charge(count);
    for (i= 0; i < count; i++) {
-      end= typeof positions === "number"? positions : positions[i];
+      end= isNumber(positions)? positions : positions[i];
       if (end < 0) continue;
-      event= make(state);
+      event= make();
       event.cursor= cursor;
       event.group= cursor.group;
       event.name= group.name;
       event.maximum= group.maximum;
       event.position= start;
-      range= event.range= make(state);
-      charge(state, cursor.node.keys.length, cursor.node.keys.length * 8 + 32, 1);
+      range= event.range= make();
+      charge(cursor.node.keys.length, cursor.node.keys.length * 8 + 32, 1);
       range.path= cursor.node.keys.slice(cursor.node.tree === root.tree? root.keys.length : 0);
       range.ofs= start;
       range.len= end - start;
       range.lim= end;
-      trace= captureAppend(state, sequenceTrace(positions, end, state.captures), event);
-      result= sequenceAdd(state, result, end, trace, cursor);
+      trace= captureAppend(sequenceTrace(positions, end, activeState.captures), event);
+      result= sequenceAdd(result, end, trace, cursor);
    }
    return result;
 }
 
 // ALL chooses each argument's nearest endpoint at or before the output. Its
 // independently resolved annotation suffixes are then merged onto one prefix.
-function sequenceAll(state, positions, branches, prefix, cursor) {
-   var result= -1, count= typeof positions === "number"? 1 : positions.length;
+function sequenceAll(positions, branches, prefix, cursor) {
+   var result= -1, count= isNumber(positions)? 1 : positions.length;
    var i, j, k, end, source, nearest, position, trace, merged, events, length;
-   charge(state, count);
+   charge(count);
    for (i= 0; i < count; i++) {
-      end= typeof positions === "number"? positions : positions[i];
+      end= isNumber(positions)? positions : positions[i];
       merged= prefix;
-      charge(state, branches.length);
+      charge(branches.length);
       for (j= 0; j < branches.length; j++) {
          source= branches[j];
          nearest= -1;
-         length= typeof source === "number"? 1 : source.length;
-         charge(state, length);
+         length= isNumber(source)? 1 : source.length;
+         charge(length);
          for (k= 0; k < length; k++) {
-            position= typeof source === "number"? source : source[k];
+            position= isNumber(source)? source : source[k];
             if (position <= end && position > nearest) nearest= position;
          }
          trace= sequenceTrace(source, nearest, prefix);
-         events= make(state, true);
+         events= make(true);
          while (trace !== prefix) {
-            charge(state, 1, 8);
+            charge(1, 8);
             events.push(trace.event);
             trace= trace.previous;
          }
-         charge(state, events.length);
+         charge(events.length);
          for (k= events.length - 1; k >= 0; k--)
-            merged= captureAppend(state, merged, events[k]);
+            merged= captureAppend(merged, events[k]);
       }
-      result= sequenceAdd(state, result, end, merged, cursor);
+      result= sequenceAdd(result, end, merged, cursor);
    }
    return result;
 }
@@ -1691,15 +1784,15 @@ function sequenceAll(state, positions, branches, prefix, cursor) {
 // Compose consecutive terms over their frontier sets. Structural arrays start
 // at element zero; SEQ skips its opcode. Duplicate paths collapse by position.
 // ARRAY skips two operands and explicitly marks a fresh capture-group root.
-function sequenceTerms(state, expression, scope, depth, options, cursor, start, root) {
+function sequenceTerms(expression, scope, depth, options, cursor, start, root) {
    var i, positions= Math.floor(options / 32), mode= options & 31;
    root= root || !start;
-   if (root && state.captures && !(mode & 2))
-      cursor.groups= sequenceGroups(state, expression, scope, depth, start);
-   charge(state, expression.length);
+   if (root && activeState.captures && !(mode & 2))
+      cursor.groups= sequenceGroups(expression, scope, depth, start);
+   charge(expression.length);
    for (i= start; i < expression.length && positions !== -1; i++) {
       if (root) cursor.group= i;
-      positions= sequenceApply(state, expression, i, scope, depth, mode, cursor, positions);
+      positions= sequenceApply(expression, i, scope, depth, mode, cursor, positions);
    }
    return positions;
 }
@@ -1708,38 +1801,38 @@ function sequenceTerms(state, expression, scope, depth, options, cursor, start, 
 // Reuse its cursor without constructing skipped EXISTS terms or slicing data.
 // Prefix/suffix presence checks preserve the equivalent escaped-array behavior
 // during pending MOVE deletions; matched terms may explicitly probe such holes.
-function arrayMatch(state, expression, scope, depth, mode, value) {
-   var offset= argument(state, expression, 1, scope, depth, borrow), minimum= 0, cursor, i;
+function arrayMatch(expression, scope, depth, mode, value) {
+   var offset= argument(expression, 1, scope, depth, borrow), minimum= 0, cursor, i;
    if (!integer(offset))
-      fail(state, "INVALID_OPERAND", "ARRAY requires an integer length or offset");
+      fail(invalidOperand, "ARRAY requires an integer length or offset");
    if (expression.length === 2)
       return mode & 1? value.length === offset : value.length >= offset;
    offset= offset < 0? value.length + offset : offset;
    if (offset < 0 || offset > value.length)
       return false;
-   charge(state, offset);
+   charge(offset);
    for (i= 0; i < offset; i++)
-      if (!present(state, value, i)) return false;
+      if (!present(value, i)) return false;
    if (mode & 1) {
-      charge(state, value.length - offset);
-      for (minimum= value.length; minimum > offset && present(state, value, minimum - 1); minimum--) {}
+      charge(value.length - offset);
+      for (minimum= value.length; minimum > offset && present(value, minimum - 1); minimum--) {}
    }
-   cursor= sequenceCursor(state, scope, value);
-   i= sequenceTerms(state, expression, scope, depth,
+   cursor= sequenceCursor(scope, value);
+   i= sequenceTerms(expression, scope, depth,
       offset * 32 + (mode & 1), cursor, 2, true);
-   return sequenceResolve(state, i, cursor, minimum);
+   return sequenceResolve(i, cursor, minimum);
 }
 
 // NUM has borrowed a numeric target. Null/absent bounds omit comparisons;
 // all supplied bounds are checked before comparing, including reversed ranges.
-function numberMatch(state, expression, scope, depth, value) {
-   var minimum= expression.length > 1? argument(state, expression, 1, scope, depth, borrow) : null;
-   var maximum= expression.length > 2? argument(state, expression, 2, scope, depth, borrow) : null;
-   if (minimum !== null && (typeof minimum !== "number" || !isFinite(minimum))
-         || maximum !== null && (typeof maximum !== "number" || !isFinite(maximum))
-         || minimum !== null && maximum !== null && minimum > maximum)
-      fail(state, "INVALID_OPERAND", "NUM requires ordered finite numeric bounds or null");
-   return (minimum === null || value >= minimum) && (maximum === null || value <= maximum);
+function numberMatch(expression, scope, depth, value) {
+   var minimum= expression.length > 1? argument(expression, 1, scope, depth, borrow) : null;
+   var maximum= expression.length > 2? argument(expression, 2, scope, depth, borrow) : null;
+   if (!isNull(minimum) && (!isNumber(minimum) || !isFinite(minimum))
+         || !isNull(maximum) && (!isNumber(maximum) || !isFinite(maximum))
+         || !isNull(minimum) && !isNull(maximum) && minimum > maximum)
+      fail(invalidOperand, "NUM requires ordered finite numeric bounds or null");
+   return (isNull(minimum) || value >= minimum) && (isNull(maximum) || value <= maximum);
 }
 
 // mode bits: 1 = exact, 2 = already-evaluated literal, 4 = EXPR definition
@@ -1747,122 +1840,124 @@ function numberMatch(state, expression, scope, depth, value) {
 // Bit 8 unwraps one escaped array while retaining syntax in its children.
 // target delays rebinding NODE until after a direct function/reference (or
 // constructing definition) has been evaluated in the original scope.
-function matchValue(state, expression, scope, depth, mode, target) {
+function matchValue(expression, scope, depth, mode, target) {
    var kind= type(expression), id, value, local, names, key, i, result;
-   charge(state, 1, 0, 0, depth);
+   charge(1, 0, 0, depth);
    if (!(mode & 10)) {
-      id= kind === "array" && !(expression.length === 1 && type(get(expression, 0)) === "array")
-         ? operation(state, expression, expressions) : null;
-      if (id === -5)
-         return match(state, macro(state, expression, scope, depth), scope, depth + 1, mode | 4, target);
-      if (id === 19)
-         return charsMatch(state, expression, target || scope, depth);
-      if (id === 12) {
-         local= bindingScope(state, expression, target || scope, depth, false);
-         return argument(state, expression, expression.length - 1, local, depth, match, mode & 1);
-      }
-      if (id === 11) {
-         arity(state, expression, 1, 1);
-         scope= target || scope;
-         castDate(state, read(state, scope.node, depth));
-         return true;
-      }
-      if (id >= 7 && id <= 10) {
-         arity(state, expression, 1, id === 7? Infinity : id === 8? 2 : id === 9? 3 : 1);
-         scope= target || scope;
-         value= read(state, scope.node, depth);
-         if (type(value) !== (id === 7? "array" : id === 8? "string" : id === 9? "number" : "boolean"))
-            return false;
-         if (expression.length === 1)
-            return true;
-         if (id === 7)
-            return arrayMatch(state, expression, scope, depth, mode, value);
-         if (id === 9)
-            return numberMatch(state, expression, scope, depth, value);
-         local= sequenceCursor(state, scope, value);
-         i= 0;
-         do {
-            result= argument(state, expression, 1, scope, depth, sequenceTerm, i * 32 + 16 + (mode & 1), local);
-            if (sequenceResolve(state, result, local, 0))
+      id= kind === TYPE_ARRAY && !(expression.length === 1 && isArray(get(expression, 0)))
+         ? operation(expression, expressions) : null;
+      // Positive match IDs are 1..19; null denotes literal structure. Partition
+      // once so child nodes can use the implied bounds rather than repeat ranges.
+      if (id > HAS - 1 && id < CHARS + 1) {
+         if (id < EXISTS + 1) { // HAS=1 through EXISTS=6
+            scope= target || scope;
+            if (id < IS + 1) { // HAS=1, IS=2
+               arity(expression, 2, 3);
+               local= expression.length === 3? valueScope(scope,
+                  argument(expression, 1, scope, depth, borrow)) : scope;
+               return argument(expression, expression.length - 1, scope, depth, match,
+                  id > IS - 1? 1 : 0, local);
+            }
+            if (id > EXISTS - 1) { // EXISTS=6
+               arity(expression, 1, 1);
+               read(scope.node, depth);
                return true;
-         } while (!sequencePosition(state, local, i++));
-         return false;
-      }
-      if (id === 17 || id === 18) {
-         arity(state, expression, 1, 1);
-         scope= target || scope;
-         i= scope.node.keys.length - 1;
-         if (i < 0)
-            return false;
-         local= parentReference(state, scope.node);
-         value= read(state, local, depth);
-         return type(value) === "array" && scope.node.keys[i] === (id === 17? 0 : value.length);
-      }
-      if (id !== null && id >= 1 && id <= 6) {
-         scope= target || scope;
-         if (id <= 2) {
-            arity(state, expression, 2, 3);
-            local= expression.length === 3? valueScope(state, scope,
-               argument(state, expression, 1, scope, depth, borrow)) : scope;
-            return argument(state, expression, expression.length - 1, scope, depth, match,
-               id === 2? 1 : 0, local);
+            }
+            // NONE=3, ANY=4, ALL=5; only ANY has the middle ID.
+            arity(expression, id < NONE + 1? 1 : 2, Infinity);
+            charge(expression.length);
+            for (i= 1; i < expression.length; i++) {
+               result= argument(expression, i, scope, depth,
+                  id > ALL - 1? match : matchWithoutCaptures, mode & 1);
+               if (result !== (id > ALL - 1))
+                  return id === ANY;
+            }
+            return id !== ANY;
+         } else if (id < WITH + 1) { // ARRAY=7 through WITH=12
+            if (id < BOOL + 1) { // ARRAY=7, STR=8, NUM=9, BOOL=10
+               arity(expression, 1, id < ARRAY + 1? Infinity : id < STR + 1? 2 : id < NUM + 1? 3 : 1);
+               scope= target || scope;
+               value= read(scope.node, depth);
+               if (type(value) !== (id < ARRAY + 1? TYPE_ARRAY : id < STR + 1? TYPE_STRING : id < NUM + 1? TYPE_NUMBER : TYPE_BOOLEAN))
+                  return false;
+               if (expression.length === 1)
+                  return true;
+               if (id < ARRAY + 1)
+                  return arrayMatch(expression, scope, depth, mode, value);
+               if (id > NUM - 1) // BOOL=10 returned above; only STR=8/NUM=9 remain.
+                  return numberMatch(expression, scope, depth, value);
+               local= sequenceCursor(scope, value);
+               i= 0;
+               do {
+                  result= argument(expression, 1, scope, depth, sequenceTerm, i * 32 + 16 + (mode & 1), local);
+                  if (sequenceResolve(result, local, 0))
+                     return true;
+               } while (!sequencePosition(local, i++));
+               return false;
+            } else if (id < DATE + 1) { // DATE=11
+               arity(expression, 1, 1);
+               scope= target || scope;
+               castDate(read(scope.node, depth));
+               return true;
+            } else { // WITH=12
+               local= bindingScope(expression, target || scope, depth, false);
+               return argument(expression, expression.length - 1, local, depth, match, mode & 1);
+            }
+         } else if (id > START - 1) { // SEQ=13..REP=16 retain the fallback below.
+            if (id < END + 1) { // START=17, END=18
+               arity(expression, 1, 1);
+               scope= target || scope;
+               i= scope.node.keys.length - 1;
+               if (i < 0)
+                  return false;
+               local= parentReference(scope.node);
+               value= read(local, depth);
+               return isArray(value) && scope.node.keys[i] === (id < START + 1? 0 : value.length);
+            }
+            return charsMatch(expression, target || scope, depth); // CHARS=19
          }
-         if (id === 6) {
-            arity(state, expression, 1, 1);
-            read(state, scope.node, depth);
-            return true;
-         }
-         arity(state, expression, id === 3? 1 : 2, Infinity);
-         charge(state, expression.length);
-         for (i= 1; i < expression.length; i++) {
-            result= argument(state, expression, i, scope, depth,
-               id === 5? match : matchWithoutCaptures, mode & 1);
-            if (result !== (id === 5))
-               return id === 4;
-         }
-         return id !== 4;
-      }
-      if (id !== null || mode & 4) {
-         expression= borrow(state, expression, scope, depth + 1);
+      } else if (id === EXPR) // EXPR=-5
+         return match(macro(expression, scope, depth), scope, depth + 1, mode | 4, target);
+      if (!isNull(id) || mode & 4) {
+         expression= borrow(expression, scope, depth + 1);
          kind= type(expression);
          mode= mode & 1 | 2;
-      } else if (kind === "array") {
+      } else if (kind === TYPE_ARRAY) {
          // An escaped array adds a structural level to diagnostics/depth.
-         return argument(state, expression, 0, target || scope, depth, match, mode | 8);
+         return argument(expression, 0, target || scope, depth, match, mode | 8);
       }
    }
    scope= target || scope;
-   value= read(state, scope.node, depth);
+   value= read(scope.node, depth);
    if (kind !== type(value))
       return false;
-   if (kind !== "array" && kind !== "object") {
-      charge(state, kind === "string"? (expression.length + value.length) * 0.001 : 1);
-      return kind === "date"? compare(state, expression, value, depth) === 0 : expression === value;
+   if (kind !== TYPE_ARRAY && kind !== TYPE_OBJECT) {
+      charge(kind === TYPE_STRING? (expression.length + value.length) * 0.001 : 1);
+      return kind === TYPE_DATE? compare(expression, value, depth) === 0 : expression === value;
    }
-   if (kind === "array") {
-      local= sequenceCursor(state, scope, value);
-      i= sequenceTerms(state, expression, scope, depth, mode & 3, local, 0);
-      return sequenceResolve(state, i, local, mode & 1? value.length : 0);
+   if (kind === TYPE_ARRAY) {
+      local= sequenceCursor(scope, value);
+      i= sequenceTerms(expression, scope, depth, mode & 3, local, 0);
+      return sequenceResolve(i, local, mode & 1? value.length : 0);
    }
-   names= keys(state, expression);
+   names= keys(expression);
    if (mode & 1) {
-      local= keys(state, value);
-      charge(state, local.length);
+      local= keys(value);
+      charge(local.length);
       for (i= 0; i < local.length; i++)
          if (!owns(expression, local[i]))
             return false;
    }
-   local= scopeCopy(state, scope);
-   local.node= make(state);
+   local= scopeCopy(scope);
+   local.node= make();
    local.node.tree= scope.node.tree;
-   charge(state, scope.node.keys.length, 32 + scope.node.keys.length * 8, 1);
-   local.node.keys= scope.node.keys.slice(0);
-   charge(state, names.length, 8);
+   local.node.keys= copyPath(scope.node.keys);
+   charge(names.length, 8);
    for (i= 0; i < names.length; i++) {
       key= names[i];
       local.node.keys.push(key);
       // Bit 4 accompanies only this EXPR root; literal children retain bit 2.
-      result= argument(state, expression, key, local, depth, match, mode & 3);
+      result= argument(expression, key, local, depth, match, mode & 3);
       local.node.keys.pop();
       if (!result)
          return false;
@@ -1872,9 +1967,9 @@ function matchValue(state, expression, scope, depth, mode, target) {
 
 // CASTSTR numbers use JSON's fractional spelling but decimal integer digits.
 // Expand positive exponents without multiplying/rounding the stored number.
-function scalarString(state, value) {
+function scalarString(value) {
    var text, exponent, point;
-   charge(state, 1, 64);
+   charge(1, 64);
    text= integer(value) || !isFinite(value)? String(value) : JSON.stringify(value);
    exponent= text.indexOf("e");
    if (integer(value) && exponent !== -1) {
@@ -1885,7 +1980,7 @@ function scalarString(state, value) {
          exponent-= text.length - point - 1;
          text= stringSlice.call(text, 0, point) + stringSlice.call(text, point + 1);
       }
-      charge(state, exponent + text.length, exponent * 12 + text.length * 2 + 32, 1);
+      charge(exponent + text.length, exponent * 12 + text.length * 2 + 32, 1);
       text+= new Array(exponent + 1).join("0");
    }
    return text;
@@ -1893,140 +1988,156 @@ function scalarString(state, value) {
 
 // Cast a borrowed scalar without consulting user coercion methods. Date JSON
 // encoding receives a fresh native Date so input toJSON/valueOf are ignored.
-function cast(state, id, value, depth) {
+// Caller restricts id to CASTBOOL=68, CASTNUM=69, or CASTSTR=70.
+function cast(id, value, depth) {
    var kind= type(value), text, year;
-   if (id === 68) {
-      if (kind === "boolean") return value;
-      if (kind === "string") charge(state, value.length * 0.001);
+   if (id < CASTBOOL + 1) {
+      if (kind === TYPE_BOOLEAN) return value;
+      if (kind === TYPE_STRING) charge(value.length * 0.001);
       if (value === 0 || value === 1 || value === "true" || value === "false")
          return value === 1 || value === "true";
-   } else if (id === 69) {
-      if (kind === "number") return value;
-      if (kind === "string") {
-         charge(state, value.length * 3);
+   } else if (id < CASTNUM + 1) {
+      if (kind === TYPE_NUMBER) return value;
+      if (kind === TYPE_STRING) {
+         charge(value.length * 3);
          if (regexpTest.call(jsonNumber, value)) {
             text= Number(value);
             if (!isFinite(text) || text === 0 && regexpTest.call(nonzeroMantissa, value))
-               fail(state, "UNSUPPORTED_GRAFT", "Number is outside the host numeric range");
+               fail(unsupportedGraft, "Number is outside the host numeric range");
             return text;
          }
       }
    } else {
-      if (kind === "string") return value;
-      if (kind === "boolean") return value? "true" : "false";
-      if (kind === "number") return scalarString(state, value);
-      if (value instanceof DateValue) return dateString(state, value);
-      if (kind === "date" && isFinite(dateTime.call(value))) {
-         charge(state, 1, 128);
+      if (kind === TYPE_STRING) return value;
+      if (kind === TYPE_BOOLEAN) return value? "true" : "false";
+      if (kind === TYPE_NUMBER) return scalarString(value);
+      if (value instanceof DateValue) return dateString(value);
+      if (kind === TYPE_DATE && isFinite(dateTime.call(value))) {
+         charge(1, 128);
          year= dateYear.call(value);
-         text= stringSlice.call(JSON.stringify(copy(state, value, depth)), 1, -1);
+         text= stringSlice.call(JSON.stringify(copy(value, depth)), 1, -1);
          // Old JSON/ISO encoders omit the sign and six-digit padding on years
          // outside 0000..9999. Native Date years always fit six digits.
          if (year < 0 || year > 9999) {
-            charge(state, 1, 64);
+            charge(1, 64);
             text= (year < 0? "-" : "+") + stringSlice.call("000000" + Math.abs(year), -6)
                + stringSlice.call(text, text.indexOf("-", year < 0? 1 : 0));
          }
          return text;
       }
    }
-   fail(state, "INVALID_TARGET", "Cannot cast this value");
+   fail(invalidTarget, "Cannot cast this value");
 }
 
-function evaluateValue(state, expression, scope, depth, borrowed) {
+// Borrow an explicit operand, or NODE when the argument is omitted.
+// Comparisons use a distinct implicit arity because their bound is mandatory.
+function operand(expression, scope, depth, index, implicit) {
+   return expression.length === (implicit || index)? read(scope.node, depth)
+      : argument(expression, index, scope, depth, borrow);
+}
+
+function evaluateValue(expression, scope, depth, borrowed) {
    var kind= type(expression), id, value, local, i, reference;
-   location(state, scope);
-   charge(state, 1, 0, 0, depth);
-   if (kind === "object")
-      return construct(state, expression, scope, depth);
-   if (kind !== "array")
-      return copy(state, expression, depth);
-   if (expression.length === 1 && type(get(expression, 0)) === "array")
-      return argument(state, expression, 0, scope, depth, construct);
-   id= operation(state, expression, expressions);
-   if (id === -5)
-      return evaluate(state, macro(state, expression, scope, depth), scope, depth + 1, borrowed);
-   if (id >= -4 && id <= 0) {
-      reference= path(state, expression, scope, depth);
-      value= read(state, reference, depth);
-      value= borrowed? value : copy(state, value, depth);
-      state.element= referenceElement(state, reference, depth);
-      return value;
+   location(scope);
+   charge(1, 0, 0, depth);
+   if (kind === TYPE_OBJECT)
+      return construct(expression, scope, depth);
+   if (kind !== TYPE_ARRAY)
+      return copy(expression, depth);
+   if (expression.length === 1 && isArray(get(expression, 0)))
+      return argument(expression, 0, scope, depth, construct);
+   id= operation(expression, expressions);
+   // operation() proves integer type. These bounds also exclude unknown IDs:
+   // references/matches are -5..19, functions are 50..78; 20..49 is reserved.
+   if (id < CHARS + 1) {
+      if (id < NODE + 1) {
+         if (id === EXPR) // EXPR=-5
+            return evaluate(macro(expression, scope, depth), scope, depth + 1, borrowed);
+         if (id > CAP - 1) { // CAP=-4 through NODE=0
+            reference= path(expression, scope, depth);
+            value= read(reference, depth);
+            value= borrowed? value : copy(value, depth);
+            activeState.element= referenceElement(reference, depth);
+            return value;
+         }
+      } else if (id < WITH + 1 || id > START - 1) // HAS=1..WITH=12, START=17..CHARS=19
+         return match(expression, scope, depth);
+   } else if (id > CAPTURE - 1 && id < MOD + 1) {
+      if (id < JOIN + 1) {
+         if (id < CONCAT + 1) {
+            if (id < LENGTH + 1) {
+               if (id < LOCAL + 1) {
+                  if (id < CAPTURE + 1) { // CAPTURE=50
+                     arity(expression, 2, 2);
+                     return argument(expression, 1, scope, depth, captureMatch);
+                  } else { // LOCAL=51
+                     local= bindingScope(expression, scope, depth, true);
+                     return argument(expression, expression.length - 1, local, depth);
+                  }
+               } else if (id < OR + 1) { // NOT=52, AND=53, OR=54
+                  arity(expression, 2, Infinity);
+                  charge(expression.length);
+                  for (i= 1; i < expression.length; i++) {
+                     value= argument(expression, i, scope, depth, borrow);
+                     if (!isBoolean(value))
+                        fail(invalidTarget, "Boolean functions require boolean arguments");
+                     // AND stops at false; OR and NOT/NOR stop at true.
+                     if (value === (id !== AND))
+                        return id > OR - 1;
+                  }
+                  return id < AND + 1;
+               }
+               // LENGTH=55 falls through to the unary source reader below.
+            } else if (id < CURPROP + 1) { // CURPROP=56
+               arity(expression, 1, 1);
+               return currentProperty(scope, depth);
+            } else if (id < SLICE + 1) // SLICE=57
+               return slice(expression, scope, depth);
+            else // CONCAT=58
+               return concat(expression, scope, depth);
+         } else if (id < MAP + 1) // REDUCE=59, FILTER=60, MAP=61
+            return iterate(expression, scope, depth, id);
+         else { // SPLIT=62, JOIN=63
+            arity(expression, 2, 3);
+            local= argument(expression, 1, scope, depth, splitConfig);
+            value= operand(expression, scope, depth, 2);
+            return id < SPLIT + 1? splitString(value, local, depth) : joinArray(value, local);
+         }
+      } else if (id < CASTDATE + 1) {
+         if (id < FAIL + 1) {
+            if (id < MKOBJ + 1) {
+               if (id < PROPS + 1) // PROPS=64
+                  return objectProperties(expression, scope, depth);
+               return makeObject(expression, scope, depth); // MKOBJ=65
+            }
+            // CASE=66, FAIL=67
+            arity(expression, id < CASE + 1? 3 : 1, id < CASE + 1? Infinity : 1);
+            if (id < CASE + 1) {
+               // Conditions use match context; only one result is constructed.
+               // A selected result's failure propagates rather than trying a fallback.
+               charge(expression.length);
+               for (i= 1; i < expression.length - 1; i+= 2)
+                  if (argument(expression, i, scope, depth, match))
+                     return argument(expression, i + 1, scope, depth);
+               if (!(expression.length % 2))
+                  return argument(expression, expression.length - 1, scope, depth);
+            }
+            fail(invalidTarget, id < CASE + 1? "No CASE condition matched" : "Explicit FAIL expression");
+         }
+         // CASTBOOL=68 through CASTDATE=71 share the LENGTH source reader.
+      } else if (id < LESSEQ + 1) { // LESS=72, LESSEQ=73
+         arity(expression, 2, 3);
+         value= operand(expression, scope, depth, 1, 2);
+         value= compare(value, argument(expression, expression.length - 1, scope, depth, borrow), depth);
+         return id < LESS + 1? value < 0 : value <= 0;
+      } else // ADD=74 through MOD=78
+         return math(expression, scope, depth, id);
+      // Only LENGTH=55 and CASTBOOL=68..CASTDATE=71 can reach this point.
+      arity(expression, 1, 2);
+      value= operand(expression, scope, depth, 1);
+      return id < LENGTH + 1? lengthOf(value) : id > CASTDATE - 1? castDate(value) : cast(id, value, depth);
    }
-   if (id >= 1 && id <= 12 || id >= 17 && id <= 19)
-      return match(state, expression, scope, depth);
-   if (id === 50) {
-      arity(state, expression, 2, 2);
-      return argument(state, expression, 1, scope, depth, captureMatch);
-   }
-   if (id >= 52 && id <= 54) {
-      arity(state, expression, 2, Infinity);
-      charge(state, expression.length);
-      for (i= 1; i < expression.length; i++) {
-         value= argument(state, expression, i, scope, depth, borrow);
-         if (typeof value !== "boolean")
-            fail(state, "INVALID_TARGET", "Boolean functions require boolean arguments");
-         // AND stops at false; OR and NOT/NOR stop at true.
-         if (value === (id !== 53))
-            return id === 54;
-      }
-      return id !== 54;
-   }
-   if (id === 55 || id >= 68 && id <= 71) {
-      arity(state, expression, 1, 2);
-      value= expression.length === 1? read(state, scope.node, depth)
-         : argument(state, expression, 1, scope, depth, borrow);
-      return id === 55? lengthOf(state, value) : id === 71? castDate(state, value) : cast(state, id, value, depth);
-   }
-   if (id === 72 || id === 73) {
-      arity(state, expression, 2, 3);
-      value= expression.length === 2? read(state, scope.node, depth)
-         : argument(state, expression, 1, scope, depth, borrow);
-      value= compare(state, value, argument(state, expression, expression.length - 1, scope, depth, borrow), depth);
-      return id === 72? value < 0 : value <= 0;
-   }
-   if (id >= 74 && id <= 78)
-      return math(state, expression, scope, depth, id);
-   if (id === 56) {
-      arity(state, expression, 1, 1);
-      return currentProperty(state, scope, depth);
-   }
-   if (id >= 59 && id <= 61)
-      return iterate(state, expression, scope, depth, id);
-   if (id === 57)
-      return slice(state, expression, scope, depth);
-   if (id === 58)
-      return concat(state, expression, scope, depth);
-   if (id === 64)
-      return objectProperties(state, expression, scope, depth);
-   if (id === 65)
-      return makeObject(state, expression, scope, depth);
-   if (id === 62 || id === 63) {
-      arity(state, expression, 2, 3);
-      local= argument(state, expression, 1, scope, depth, splitConfig);
-      value= expression.length === 2? read(state, scope.node, depth)
-         : argument(state, expression, 2, scope, depth, borrow);
-      return id === 62? splitString(state, value, local, depth) : joinArray(state, value, local);
-   }
-   if (id === 66 || id === 67) {
-      arity(state, expression, id === 66? 3 : 1, id === 66? Infinity : 1);
-      if (id === 66) {
-         // Conditions use match context; only one result is constructed.
-         // A selected result's failure propagates rather than trying a fallback.
-         charge(state, expression.length);
-         for (i= 1; i < expression.length - 1; i+= 2)
-            if (argument(state, expression, i, scope, depth, match))
-               return argument(state, expression, i + 1, scope, depth);
-         if (!(expression.length % 2))
-            return argument(state, expression, expression.length - 1, scope, depth);
-      }
-      fail(state, "INVALID_TARGET", id === 66? "No CASE condition matched" : "Explicit FAIL expression");
-   }
-   if (id === 51) {
-      local= bindingScope(state, expression, scope, depth, true);
-      return argument(state, expression, expression.length - 1, local, depth);
-   }
-   fail(state, "INVALID_GRAFT", "Unsupported value expression");
+   fail(invalidGraft, "Unsupported value expression");
 }
 
 // Decode at a UTF-16 boundary. step returns the width instead of the numeric
@@ -2048,110 +2159,111 @@ function character(info, offset, step) {
 // Return -1/0/1 for orderable same-type values. Arrays visit each required
 // pair once, stopping at the first difference; unsupported visited elements
 // still fail even when identical. Date precision is part of its logical type.
-function compare(state, left, right, depth) {
+function compare(left, right, depth) {
    var kind= type(left), a, b, info, other, result, i= 0, j= 0;
-   charge(state, 1, 0, 0, depth);
-   if (kind !== type(right)) fail(state, "INVALID_TARGET", "Comparison requires matching types");
-   if (kind === "date") {
-      a= dateRecord(state, left);
-      b= dateRecord(state, right);
-      if (a.count !== b.count) fail(state, "INVALID_TARGET", "Comparison requires matching date precision");
-      left= dateComparable(state, a, depth);
-      right= dateComparable(state, b, depth);
-      kind= "array";
+   charge(1, 0, 0, depth);
+   if (kind !== type(right)) fail(invalidTarget, "Comparison requires matching types");
+   if (kind === TYPE_DATE) {
+      a= dateRecord(left);
+      b= dateRecord(right);
+      if (a.count !== b.count) fail(invalidTarget, "Comparison requires matching date precision");
+      left= dateComparable(a, depth);
+      right= dateComparable(b, depth);
+      kind= TYPE_ARRAY;
    }
-   if (kind === "string") {
-      info= stringInfo(state, left);
-      other= stringInfo(state, right);
-      charge(state, (left.length + right.length) * 0.001);
+   if (kind === TYPE_STRING) {
+      info= stringInfo(left);
+      other= stringInfo(right);
+      charge((left.length + right.length) * 0.001);
    }
    // Native code-unit order agrees with codepoint order when neither string
    // has a surrogate pair. Otherwise decode only the compared prefix.
-   if (kind === "array" || info && (info.checkpoints || other.checkpoints)) {
+   if (kind === TYPE_ARRAY || info && (info.checkpoints || other.checkpoints)) {
       while (i < left.length && j < right.length) {
-         charge(state, 1);
+         charge(1);
          if (info) {
             a= character(info, i);
             b= character(other, j);
          } else {
-            if (!present(state, left, i) || !present(state, right, j))
-               fail(state, "INVALID_TARGET", "Cannot compare a missing or pending-deletion element");
+            if (!present(left, i) || !present(right, j))
+               fail(invalidTarget, "Cannot compare a missing or pending-deletion element");
             a= get(left, i);
             b= get(right, j);
          }
-         result= info? a - b : compare(state, a, b, depth + 1);
+         result= info? a - b : compare(a, b, depth + 1);
          if (result) return result < 0? -1 : 1;
          i+= info? character(info, i, true) : 1;
          j+= info? character(other, j, true) : 1;
       }
       left= left.length - i;
       right= right.length - j;
-   } else if (kind !== "number" && kind !== "boolean" && kind !== "string")
-      fail(state, "INVALID_TARGET", "This type is not orderable");
-   if (left !== left || right !== right) fail(state, "INVALID_TARGET", "NaN is not orderable");
+   } else if (kind !== TYPE_NUMBER && kind !== TYPE_BOOLEAN && kind !== TYPE_STRING)
+      fail(invalidTarget, "This type is not orderable");
+   if (left !== left || right !== right) fail(invalidTarget, "NaN is not orderable");
    return left < right? -1 : left > right? 1 : 0;
 }
 
 // Enumerate only own keys, sorted by the same Unicode order as LESS/LESSEQ.
 // Names need no value traversal; value-bearing forms own independent copies.
-function objectProperties(state, expression, scope, depth) {
+function objectProperties(expression, scope, depth) {
    var option= get(expression, 2), source, names, values, value, i;
-   arity(state, expression, 1, 3);
+   arity(expression, 1, 3);
    if (expression.length === 3 && option !== 1 && option !== 2)
-      fail(state, "INVALID_GRAFT", "PROPS requires literal option 1 or 2");
-   source= expression.length === 1? read(state, scope.node, depth)
-      : argument(state, expression, 1, scope, depth, borrow);
-   if (type(source) !== "object")
-      fail(state, "INVALID_TARGET", "PROPS requires an object");
-   names= keys(state, source);
-   charge(state, names.length * (1 + Math.log(names.length || 1) / Math.LN2), names.length * 16);
-   names.sort(function(left, right) {return compare(state, left, right, depth);});
+      fail(invalidGraft, "PROPS requires literal option 1 or 2");
+   source= operand(expression, scope, depth, 1);
+   if (type(source) !== TYPE_OBJECT)
+      fail(invalidTarget, "PROPS requires an object");
+   names= keys(source);
+   charge(names.length * (1 + Math.log(names.length || 1) / Math.LN2), names.length * 16);
+   names.sort(function(left, right) {return compare(left, right, depth);});
    if (expression.length < 3) return names;
-   values= make(state, true);
-   charge(state, names.length, names.length * 8);
+   values= make(true);
+   charge(names.length, names.length * 8);
    for (i= 0; i < names.length; i++) {
-      value= copy(state, get(source, names[i]), depth + 1);
-      values.push(option === 1? makePair(state, names[i], value) : value);
+      value= copy(get(source, names[i]), depth + 1);
+      values.push(option === 1? makePair(names[i], value) : value);
    }
-   return option === 1? values : makePair(state, names, values);
+   return option === 1? values : makePair(names, values);
 }
 
 // Allocate an owned two-element array with one combined resource charge.
-function makePair(state, left, right) {
-   charge(state, 2, 48, 1);
+function makePair(left, right) {
+   charge(2, 48, 1);
    return [left, right];
 }
 
 // Fold explicit value operands, or ADD/MUL's sole array operand as numeric
 // data. Every operand is checked, including factors after zero. Math returns
 // only finite numbers; MOD corrects remainder signs without a second division.
-function math(state, expression, scope, depth, id) {
-   var fold= id === 74 || id === 76, single= expression.length === 2;
-   var source, array= false, count= expression.length - 1, result= id === 76? 1 : 0, value, i;
-   arity(state, expression, fold? 1 : 3, fold? Infinity : 3);
+// Caller restricts id to ADD=74, SUB=75, MUL=76, DIV=77, or MOD=78.
+function math(expression, scope, depth, id) {
+   // Only ADD/MUL use the initializer; SUB/DIV/MOD replace it at i=0.
+   var fold= id < ADD + 1 || id === MUL, single= expression.length === 2;
+   var source, array= false, count= expression.length - 1, result= id > MUL - 1? 1 : 0, value, i;
+   arity(expression, fold? 1 : 3, fold? Infinity : 3);
    if (single) {
-      source= argument(state, expression, 1, scope, depth, borrow);
-      array= type(source) === "array";
+      source= argument(expression, 1, scope, depth, borrow);
+      array= isArray(source);
       if (array) count= source.length;
    }
-   charge(state, count);
+   charge(count);
    for (i= 0; i < count; i++) {
-      if (array && !present(state, source, i))
-         fail(state, "INVALID_TARGET", "Cannot enumerate a missing or pending-deletion element");
-      value= array? get(source, i) : single? source : argument(state, expression, i + 1, scope, depth, borrow);
-      if (typeof value !== "number") fail(state, "INVALID_TARGET", "Math requires numeric operands");
+      if (array && !present(source, i))
+         fail(invalidTarget, "Cannot enumerate a missing or pending-deletion element");
+      value= array? get(source, i) : single? source : argument(expression, i + 1, scope, depth, borrow);
+      if (!isNumber(value)) fail(invalidTarget, "Math requires numeric operands");
       if (!fold && !i)
          result= value;
       else {
-         if (id >= 77 && value === 0) fail(state, "INVALID_TARGET", "Division by zero");
-         result= id === 74? result + value : id === 75? result - value
-            : id === 76? result * value : id === 77? result / value : result % value;
-         if (id === 78 && result && (result < 0) !== (value < 0)) {
+         if (id > DIV - 1 && value === 0) fail(invalidTarget, "Division by zero");
+         result= id < ADD + 1? result + value : id < SUB + 1? result - value
+            : id < MUL + 1? result * value : id < DIV + 1? result / value : result % value;
+         if (id > MOD - 1 && result && (result < 0) !== (value < 0)) {
             result+= value;
             // Floating correction may round to the excluded divisor boundary.
             if (result === value && isFinite(value)) result= 0;
          }
-         if (!isFinite(result)) fail(state, result !== result? "INVALID_TARGET" : "UNSUPPORTED_GRAFT", "Nonfinite arithmetic result");
+         if (!isFinite(result)) fail(result !== result? invalidTarget : unsupportedGraft, "Nonfinite arithmetic result");
       }
    }
    return result;
@@ -2159,16 +2271,16 @@ function math(state, expression, scope, depth, id) {
 
 // A singleton operand is a codepoint, one-codepoint string, or null (maximum).
 // Other strings and operand categories return -1 for the class parser.
-function charPoint(state, value) {
+function charPoint(value) {
    var info;
-   if (value === null) return 1114111;
-   if (typeof value === "number") {
+   if (isNull(value)) return 1114111;
+   if (isNumber(value)) {
       if (!integer(value) || value < 0 || value > 1114111)
-         fail(state, "INVALID_OPERAND", "Invalid Unicode codepoint");
+         fail(invalidOperand, "Invalid Unicode codepoint");
       return value;
    }
-   if (typeof value === "string") {
-      info= stringInfo(state, value);
+   if (isString(value)) {
+      info= stringInfo(value);
       if (character(info, 0, true) === value.length) return character(info, 0);
    }
    return -1;
@@ -2178,11 +2290,11 @@ function numericOrder(left, right) {return left - right;}
 
 // Sorted toggle boundaries describe half-open intervals. Decode a list once,
 // then coalesce duplicates/adjacent points without enumerating any ranges.
-function charList(state, text) {
-   var info= stringInfo(state, text), points= make(state, true), result= make(state, true), i, point;
-   charge(state, text.length * 3, text.length * 24);
+function charList(text) {
+   var info= stringInfo(text), points= make(true), result= make(true), i, point;
+   charge(text.length * 3, text.length * 24);
    for (i= 0; i < text.length; i+= character(info, i, true)) points.push(character(info, i));
-   charge(state, points.length * (1 + Math.log(points.length || 1) / Math.LN2));
+   charge(points.length * (1 + Math.log(points.length || 1) / Math.LN2));
    points.sort(numericOrder);
    for (i= 0; i < points.length; i++) {
       point= points[i];
@@ -2194,9 +2306,9 @@ function charList(state, text) {
 
 // Merge inversion lists as union (include) or subtraction (exclude). Inputs
 // remain immutable, allowing imported/cached classes to share boundary arrays.
-function charCombine(state, left, right, include) {
-   var result= make(state, true), i= 0, j= 0, a= false, b= false, previous= false, point, inside;
-   charge(state, (left.length + right.length) * 2, (left.length + right.length) * 8);
+function charCombine(left, right, include) {
+   var result= make(true), i= 0, j= 0, a= false, b= false, previous= false, point, inside;
+   charge((left.length + right.length) * 2, (left.length + right.length) * 8);
    while (i < left.length || j < right.length) {
       point= Math.min(i < left.length? left[i] : Infinity, j < right.length? right[j] : Infinity);
       if (left[i] === point) {a= !a; i++;}
@@ -2211,78 +2323,78 @@ function charCombine(state, left, right, include) {
 // Compile literal classes per application and common-expression namespace.
 // Computed EXPR names (including aliases) disable caching for their parents;
 // they may depend on the current character or a lexical TEMP binding.
-function charClass(state, expression, scope, depth) {
-   var cache= state.charsets || (state.charsets= make(state, true)), result, value, child, source, level;
+function charClass(expression, scope, depth) {
+   var cache= activeState.charsets || (activeState.charsets= make(true)), result, value, child, source, level;
    var include= true, first, last, i, id;
-   charge(state, cache.length, 0, 0, depth);
+   charge(cache.length, 0, 0, depth);
    for (i= 0; i < cache.length; i++)
       if (cache[i].source === expression && cache[i].scope === scope.expr) return cache[i];
-   result= make(state);
+   result= make();
    result.source= expression;
    result.scope= scope.expr;
    result.dynamic= false;
-   result.points= make(state, true);
-   charge(state, expression.length);
+   result.points= make(true);
+   charge(expression.length);
    for (i= 1; i < expression.length; i++) {
       value= get(expression, i);
-      if (typeof value === "boolean") {
+      if (isBoolean(value)) {
          include= value;
          if (i === 1 && !value) {
-            charge(state, 1, 16);
+            charge(1, 16);
             result.points.push(0, 1114112);
          }
          continue;
       }
-      if (type(value) === "array") {
-         state.graftPath.push(i);
+      if (isArray(value)) {
+         activeState.graftPath.push(i);
          source= value;
          level= depth;
          do {
-            charge(state, 1, 0, 0, ++level);
+            charge(1, 0, 0, ++level);
             id= get(source, 0);
-            if (id !== "EXPR" && id !== -5)
-               fail(state, "INVALID_OPERAND", "CHARS operands must reference a CHARS expression");
-            if (type(get(source, 1)) === "array") result.dynamic= true;
-            source= macro(state, source, scope, level);
-         } while (type(source) === "array" && (get(source, 0) === "EXPR" || get(source, 0) === -5));
-         if (type(source) !== "array" || get(source, 0) !== "CHARS" && get(source, 0) !== 19)
-            fail(state, "INVALID_OPERAND", "Common expression must resolve to CHARS");
-         child= charClass(state, source, scope, level);
+            if (id !== "EXPR" && id !== EXPR)
+               fail(invalidOperand, "CHARS operands must reference a CHARS expression");
+            if (isArray(get(source, 1))) result.dynamic= true;
+            source= macro(source, scope, level);
+         } while (isArray(source) && (get(source, 0) === "EXPR" || get(source, 0) === -5));
+         if (!isArray(source) || get(source, 0) !== "CHARS" && get(source, 0) !== CHARS)
+            fail(invalidOperand, "Common expression must resolve to CHARS");
+         child= charClass(source, scope, level);
          result.dynamic= result.dynamic || child.dynamic;
          child= child.points;
-         state.graftPath.pop();
+         activeState.graftPath.pop();
       } else {
-         if (value !== null && typeof value !== "number" && typeof value !== "string")
-            fail(state, "INVALID_OPERAND", "Invalid CHARS operand");
-         first= argument(state, expression, i, scope, depth, charPoint);
+         if (!isNull(value) && !isNumber(value) && !isString(value))
+            fail(invalidOperand, "Invalid CHARS operand");
+         first= argument(expression, i, scope, depth, charPoint);
          if (first < 0)
-            child= charList(state, value);
+            child= charList(value);
          else {
-            last= i + 1 < expression.length? argument(state, expression, i + 1, scope, depth, charPoint) : -1;
+            last= i + 1 < expression.length? argument(expression, i + 1, scope, depth, charPoint) : -1;
             if (last < 0) last= first;
             else i++;
-            if (first > last) fail(state, "INVALID_OPERAND", "Descending character range");
-            child= make(state, true);
-            charge(state, 1, 16);
+            if (first > last) fail(invalidOperand, "Descending character range");
+            child= make(true);
+            charge(1, 16);
             child.push(first, last + 1);
          }
       }
-      result.points= charCombine(state, result.points, child, include);
+      result.points= charCombine(result.points, child, include);
    }
    if (!result.dynamic) {
-      charge(state, 1, 8);
+      charge(1, 8);
       cache.push(result);
    }
    return result;
 }
 
-function charsMatch(state, expression, scope, depth) {
-   var points= charClass(state, expression, scope, depth).points, value= read(state, scope.node, depth);
+function charsMatch(expression, scope, depth) {
+   var points= charClass(expression, scope, depth).points, value= read(scope.node, depth);
    var low= 0, high= points.length, middle;
-   if (typeof value !== "number" && typeof value !== "string") return false;
-   value= charPoint(state, value);
+   if (!isNumber(value) && !isString(value)) return false;
+   value= charPoint(value);
    if (value < 0) return false;
-   charge(state, 1 + Math.log(high + 1) / Math.LN2);
+   charge(1 + Math.log(high + 1) / Math.LN2);
    while (low < high) {
       middle= Math.floor((low + high) / 2);
       if (points[middle] <= value) low= middle + 1;
@@ -2294,25 +2406,25 @@ function charsMatch(state, expression, scope, depth) {
 // Keep immutable strings and small indexes per application. The fixed two-unit
 // regex has no unbounded backtracking; charge its full linear scan beforehand.
 // Strings without pairs need neither checkpoints nor per-character decoding.
-function stringInfo(state, text) {
-   var list= state.strings || (state.strings= make(state, true)), info, i;
-   charge(state, list.length);
+function stringInfo(text) {
+   var list= activeState.strings || (activeState.strings= make(true)), info, i;
+   charge(list.length);
    for (i= 0; i < list.length; i++) {
-      charge(state, (list[i].text.length + text.length) * 0.001);
+      charge((list[i].text.length + text.length) * 0.001);
       if (list[i].text === text)
          return list[i];
    }
-   charge(state, text.length, 80);
-   info= make(state);
+   charge(text.length, 80);
+   info= make();
    info.text= text;
-   info.checkpoints= regexpTest.call(surrogatePair, text)? make(state, true) : null;
+   info.checkpoints= regexpTest.call(surrogatePair, text)? make(true) : null;
    info.length= info.checkpoints? null : text.length;
    info.index= info.offset= 0;
    if (info.checkpoints) {
-      charge(state, 1, 8);
+      charge(1, 8);
       info.checkpoints.push(0);
    }
-   charge(state, 1, 8);
+   charge(1, 8);
    list.push(info);
    return info;
 }
@@ -2321,7 +2433,7 @@ function stringInfo(state, text) {
 // whole string. Reuse a forward cursor or begin at the nearest checkpoint.
 // Checkpoints are built lazily every 256 codepoints; no character array is made.
 // A seek beyond the end stops there and records the actual codepoint length.
-function stringOffset(state, info, index) {
+function stringOffset(info, index) {
    var points= info.checkpoints, block, position, offset, count, i;
    if (!points)
       return index === Infinity? info.length : index;
@@ -2334,13 +2446,13 @@ function stringOffset(state, info, index) {
    }
    while (position < index && offset < info.text.length) {
       count= Math.min(256 - position % 256, index - position, info.text.length - offset);
-      charge(state, count * 2);
+      charge(count * 2);
       for (i= 0; i < count && offset < info.text.length; i++) {
          offset+= character(info, offset, true);
          position++;
       }
       if (position % 256 === 0 && position / 256 === points.length) {
-         charge(state, 1, 8);
+         charge(1, 8);
          points.push(offset);
       }
    }
@@ -2362,99 +2474,99 @@ function stringBoundary(text, offset, paired) {
    return !(first >= 0xD800 && first <= 0xDBFF && second >= 0xDC00 && second <= 0xDFFF);
 }
 
-function lengthOf(state, value) {
+function lengthOf(value) {
    var info;
-   if (type(value) !== "array" && type(value) !== "string")
-      fail(state, "INVALID_TARGET", "Expected an array or string");
-   if (typeof value !== "string")
+   if (!isArray(value) && !isString(value))
+      fail(invalidTarget, "Expected an array or string");
+   if (!isString(value))
       return value.length;
-   info= stringInfo(state, value);
-   if (info.length === null)
-      stringOffset(state, info, Infinity);
+   info= stringInfo(value);
+   if (isNull(info.length))
+      stringOffset(info, Infinity);
    return info.length;
 }
 
 // SLICE reads only its selected span, so pending deletions outside that span do
 // not invalidate it. Returned elements are independent materialized values.
-function slice(state, expression, scope, depth) {
+function slice(expression, scope, depth) {
    var value, offset, count, limit, config, names, reference, result, entries, i, kind, total, info;
-   arity(state, expression, 2, 4);
-   value= argument(state, expression, 1, scope, depth, borrow);
-   if (expression.length === 2 && type(value) === "object") {
+   arity(expression, 2, 4);
+   value= argument(expression, 1, scope, depth, borrow);
+   if (expression.length === 2 && type(value) === TYPE_OBJECT) {
       config= value;
       if (owns(config, "path")) {
-         if (type(get(config, "path")) !== "array")
-            fail(state, "INVALID_OPERAND", "SLICE path must be an array");
-         charge(state, 1, 80, 2);
-         reference= path(state, ["NODE", [get(config, "path")]], scope, depth);
-         value= read(state, reference, depth);
+         if (!isArray(get(config, "path")))
+            fail(invalidOperand, "SLICE path must be an array");
+         charge(1, 80, 2);
+         reference= path(["NODE", [get(config, "path")]], scope, depth);
+         value= read(reference, depth);
       } else
-         value= read(state, scope.node, depth);
-      total= lengthOf(state, value);
+         value= read(scope.node, depth);
+      total= lengthOf(value);
       offset= get(config, "ofs");
       count= get(config, "len");
       limit= get(config, "lim");
       names= [offset, count, limit];
-      charge(state, 3, 56, 1);
+      charge(3, 56, 1);
       for (i= 0; i < names.length; i++)
          if (names[i] !== undefined && (!integer(names[i]) || names[i] < 0))
-            fail(state, "INVALID_OPERAND", "Invalid SLICE range");
+            fail(invalidOperand, "Invalid SLICE range");
       if (offset === undefined)
          offset= count !== undefined && limit !== undefined? limit - count : 0;
       if (limit === undefined)
          limit= count !== undefined? offset + count : total;
       if (count !== undefined && offset + count !== limit)
-         fail(state, "INVALID_OPERAND", "Inconsistent SLICE range");
+         fail(invalidOperand, "Inconsistent SLICE range");
    } else {
-      total= lengthOf(state, value);
-      arity(state, expression, 3, 4);
-      offset= argument(state, expression, 2, scope, depth);
-      count= expression.length === 4? argument(state, expression, 3, scope, depth) : undefined;
+      total= lengthOf(value);
+      arity(expression, 3, 4);
+      offset= argument(expression, 2, scope, depth);
+      count= expression.length === 4? argument(expression, 3, scope, depth) : undefined;
       if (!integer(offset) || count !== undefined && !integer(count))
-         fail(state, "INVALID_OPERAND", "SLICE requires integer offsets/counts");
+         fail(invalidOperand, "SLICE requires integer offsets/counts");
       offset= offset < 0? total + offset : offset;
       limit= count === undefined? total : count < 0? total + count : offset + count;
    }
    kind= type(value);
    if (offset < 0 || offset > limit || limit > total)
-      fail(state, "INVALID_TARGET", "SLICE range is out of bounds");
-   if (kind === "string") {
-      info= stringInfo(state, value);
-      offset= stringOffset(state, info, offset);
-      limit= stringOffset(state, info, limit);
-      charge(state, limit - offset, (limit - offset) * 2);
+      fail(invalidTarget, "SLICE range is out of bounds");
+   if (kind === TYPE_STRING) {
+      info= stringInfo(value);
+      offset= stringOffset(info, offset);
+      limit= stringOffset(info, limit);
+      charge(limit - offset, (limit - offset) * 2);
       return stringSlice.call(value, offset, limit);
    }
-   charge(state, limit - offset, (limit - offset) * 8);
-   result= make(state, true);
-   entries= make(state, true);
-   appendRange(state, entries, value, offset, limit, depth);
-   rebuild(state, result, make(state), entries);
+   charge(limit - offset, (limit - offset) * 8);
+   result= make(true);
+   entries= make(true);
+   appendRange(entries, value, offset, limit, depth);
+   rebuild(result, make(), entries);
    return result;
 }
 
-function concat(state, expression, scope, depth) {
-   var result, value, kind, entries= make(state, true), i;
-   arity(state, expression, 2, Infinity);
-   charge(state, expression.length);
+function concat(expression, scope, depth) {
+   var result, value, kind, entries= make(true), i;
+   arity(expression, 2, Infinity);
+   charge(expression.length);
    for (i= 1; i < expression.length; i++) {
-      value= argument(state, expression, i, scope, depth, borrow);
+      value= argument(expression, i, scope, depth, borrow);
       if (i === 1) {
          kind= type(value);
-         result= kind === "array"? make(state, true) : "";
+         result= kind === TYPE_ARRAY? make(true) : "";
       }
-      if (type(value) !== kind || kind !== "array" && kind !== "string")
-         fail(state, "INVALID_TARGET", "CONCAT requires matching arrays or strings");
-      if (kind === "string") {
-         charge(state, result.length + value.length, (result.length + value.length) * 2);
+      if (type(value) !== kind || kind !== TYPE_ARRAY && kind !== TYPE_STRING)
+         fail(invalidTarget, "CONCAT requires matching arrays or strings");
+      if (kind === TYPE_STRING) {
+         charge(result.length + value.length, (result.length + value.length) * 2);
          result+= value;
       } else {
-         charge(state, value.length);
-         appendRange(state, entries, value, 0, value.length, depth);
+         charge(value.length);
+         appendRange(entries, value, 0, value.length, depth);
       }
    }
-   if (kind === "array")
-      rebuild(state, result, make(state), entries);
+   if (kind === TYPE_ARRAY)
+      rebuild(result, make(), entries);
    return result;
 }
 
@@ -2462,76 +2574,76 @@ function concat(state, expression, scope, depth) {
 // accumulator and materializes only its final result. FILTER copies selected
 // source values; MAP constructs one result per element. Both carry source
 // metadata, never metadata from a transform's returned element reference.
-function iterate(state, expression, scope, depth, id) {
-   var reduce= id === 59, map= id === 61, minimum= reduce? 4 : 2;
+// Caller restricts id to REDUCE=59, FILTER=60, or MAP=61.
+function iterate(expression, scope, depth, id) {
+   var reduce= id < REDUCE + 1, map= id > MAP - 1, minimum= reduce? 4 : 2;
    var name, accumulator, source, local, entries, value, result, i;
-   arity(state, expression, minimum, minimum + 1);
+   arity(expression, minimum, minimum + 1);
    if (reduce) {
       name= get(expression, 2);
-      if (typeof name !== "string" && typeof name !== "number")
-         fail(state, "INVALID_OPERAND", "REDUCE requires a literal string or number accumulator name");
+      if (!isString(name) && !isNumber(name))
+         fail(invalidOperand, "REDUCE requires a literal string or number accumulator name");
       name= String(name);
-      accumulator= argument(state, expression, 3, scope, depth, borrow);
+      accumulator= argument(expression, 3, scope, depth, borrow);
    }
-   source= expression.length > minimum? argument(state, expression, minimum, scope, depth, borrow)
-      : read(state, scope.node, depth);
-   if (type(source) !== "array") fail(state, "INVALID_TARGET", "Iteration requires an array");
-   local= valueScope(state, scope, source);
+   source= operand(expression, scope, depth, minimum);
+   if (!isArray(source)) fail(invalidTarget, "Iteration requires an array");
+   local= valueScope(scope, source);
    local.node.keys.push(0);
    if (reduce)
-      local.temp= holder(state, copy(state, scope.temp.value, depth, true), true);
+      local.temp= holder(copy(scope.temp.value, depth, true), true);
    else
-      entries= make(state, true);
-   charge(state, source.length);
+      entries= make(true);
+   charge(source.length);
    for (i= 0; i < source.length; i++) {
-      if (!present(state, source, i)) fail(state, "INVALID_TARGET", "Cannot iterate a missing or pending-deletion element");
+      if (!present(source, i)) fail(invalidTarget, "Cannot iterate a missing or pending-deletion element");
       local.node.keys[0]= i;
-      if (reduce) put(state, local.temp.value, name, accumulator);
-      value= argument(state, expression, 1, local, depth, reduce? borrow : map? evaluate : match);
+      if (reduce) put(local.temp.value, name, accumulator);
+      value= argument(expression, 1, local, depth, reduce? borrow : map? evaluate : match);
       if (reduce)
          accumulator= value;
       else if (map || value)
-         entry(state, entries, map? value : copy(state, get(source, i), depth + 1), true, elementAt(state, source, i));
+         entry(entries, map? value : copy(get(source, i), depth + 1), true, elementAt(source, i));
    }
-   if (reduce) return copy(state, accumulator, depth);
-   result= make(state, true);
-   rebuild(state, result, make(state), entries);
+   if (reduce) return copy(accumulator, depth);
+   result= make(true);
+   rebuild(result, make(), entries);
    return result;
 }
 
 // Materialize operands once in caller scope, then select alternating pairs,
 // parallel arrays, or a pair list by their evaluated shapes. All values are
 // independently owned; only string, unique own keys reach the safe writer.
-function makeObject(state, expression, scope, depth) {
-   var values= make(state, true), result= make(state), names, pairs, pair, name, value, count, i;
-   charge(state, expression.length, expression.length * 8);
+function makeObject(expression, scope, depth) {
+   var values= make(true), result= make(), names, pairs, pair, name, value, count, i;
+   charge(expression.length, expression.length * 8);
    for (i= 1; i < expression.length; i++)
-      values.push(argument(state, expression, i, scope, depth));
+      values.push(argument(expression, i, scope, depth));
    count= values.length;
-   if (count === 1 && type(values[0]) === "array") {
+   if (count === 1 && isArray(values[0])) {
       pairs= values[0];
       count= pairs.length;
-   } else if (count === 2 && type(values[0]) === "array") {
+   } else if (count === 2 && isArray(values[0])) {
       names= values[0];
       values= values[1];
-      if (type(values) !== "array" || names.length !== values.length)
-         fail(state, "INVALID_TARGET", "MKOBJ requires equally sized name and value arrays");
+      if (!isArray(values) || names.length !== values.length)
+         fail(invalidTarget, "MKOBJ requires equally sized name and value arrays");
       count= names.length;
    } else {
       if (!count || count % 2)
-         fail(state, "INVALID_TARGET", "MKOBJ requires name/value pairs");
+         fail(invalidTarget, "MKOBJ requires name/value pairs");
       count/= 2;
    }
-   charge(state, count);
+   charge(count);
    for (i= 0; i < count; i++) {
       pair= pairs? get(pairs, i) : null;
-      if (pairs && (type(pair) !== "array" || pair.length !== 2))
-         fail(state, "INVALID_TARGET", "MKOBJ property entries must be two-element arrays");
+      if (pairs && (!isArray(pair) || pair.length !== 2))
+         fail(invalidTarget, "MKOBJ property entries must be two-element arrays");
       name= pairs? get(pair, 0) : get(names || values, names? i : i * 2);
       value= pairs? get(pair, 1) : get(values, names? i : i * 2 + 1);
-      if (typeof name !== "string" || owns(result, name))
-         fail(state, "INVALID_TARGET", "MKOBJ requires unique string property names");
-      put(state, result, name, value);
+      if (!isString(name) || owns(result, name))
+         fail(invalidTarget, "MKOBJ requires unique string property names");
+      put(result, name, value);
    }
    return result;
 }
@@ -2539,100 +2651,99 @@ function makeObject(state, expression, scope, depth) {
 // Classify a pattern before evaluation: match roots retain regex syntax;
 // function/reference roots resolve once to literal strings in the caller scope.
 // Save the physical graft location for errors raised during deferred matching.
-function splitPattern(state, source, scope, depth) {
-   var result= make(state), expression= source, id= null;
-   while (type(expression) === "array") {
-      charge(state, 1, 0, 0, depth);
-      id= expression.length === 1 && type(get(expression, 0)) === "array"? null
-         : operation(state, expression, expressions);
-      if (id !== -5) break;
-      expression= macro(state, expression, scope, depth++);
+function splitPattern(source, scope, depth) {
+   var result= make(), expression= source, id= null;
+   while (isArray(expression)) {
+      charge(1, 0, 0, depth);
+      id= expression.length === 1 && isArray(get(expression, 0))? null
+         : operation(expression, expressions);
+      if (id !== EXPR) break;
+      expression= macro(expression, scope, depth++);
    }
-   result.regex= id !== null && id >= 1 && id <= 19;
-   result.expression= result.regex? expression : borrow(state, source, scope, depth);
-   if (!result.regex && typeof result.expression !== "string")
-      fail(state, "INVALID_OPERAND", "SPLIT requires string or regex patterns");
+   result.regex= !isNull(id) && id > HAS - 1 && id < CHARS + 1; // HAS=1 through CHARS=19
+   result.expression= result.regex? expression : borrow(source, scope, depth);
+   if (!result.regex && !isString(result.expression))
+      fail(invalidOperand, "SPLIT requires string or regex patterns");
    result.depth= depth;
-   charge(state, state.graftPath.length, 32 + state.graftPath.length * 8, 1);
-   result.path= state.graftPath.slice(0);
-   result.length= result.regex? null : lengthOf(state, result.expression);
+   result.path= copyPath(activeState.graftPath);
+   result.length= result.regex? null : lengthOf(result.expression);
    return result;
 }
 
-function splitConfig(state, source, scope, depth) {
-   var result= make(state), names, key, i, raw, simple= type(source) !== "object";
+function splitConfig(source, scope, depth) {
+   var result= make(), names, key, i, raw, simple= type(source) !== TYPE_OBJECT;
    result.scope= scope;
    if (simple) {
-      raw= make(state);
+      raw= make();
       raw.sep= source;
       source= raw;
    }
-   names= keys(state, source);
-   charge(state, names.length);
+   names= keys(source);
+   charge(names.length);
    for (i= 0; i < names.length; i++) {
       key= names[i];
       if (key !== "sep" && key !== "default" && key !== "trim" && key !== "ltrim"
             && key !== "rtrim" && key !== "discard" && key !== "keep" && key !== "element")
-         fail(state, "INVALID_OPERAND", "Unknown SPLIT option: " + key);
+         fail(invalidOperand, "Unknown SPLIT option: " + key);
    }
    if (owns(source, "trim") && (owns(source, "ltrim") || owns(source, "rtrim")))
-      fail(state, "INVALID_OPERAND", "SPLIT trim conflicts with ltrim/rtrim");
+      fail(invalidOperand, "SPLIT trim conflicts with ltrim/rtrim");
    if (!owns(source, "sep"))
-      fail(state, "INVALID_OPERAND", "SPLIT requires a separator");
+      fail(invalidOperand, "SPLIT requires a separator");
    result.keep= get(source, "keep");
    if (owns(source, "keep") && result.keep !== "<" && result.keep !== ">" && result.keep !== "@")
-      fail(state, "INVALID_OPERAND", "Invalid SPLIT keep mode");
-   result.pattern= simple? splitPattern(state, get(source, "sep"), scope, depth + 1)
-      : argument(state, source, "sep", scope, depth, splitPattern);
+      fail(invalidOperand, "Invalid SPLIT keep mode");
+   result.pattern= simple? splitPattern(get(source, "sep"), scope, depth + 1)
+      : argument(source, "sep", scope, depth, splitPattern);
    result.variable= result.pattern.regex && !result.keep;
    if (result.variable && !owns(source, "default"))
-      fail(state, "INVALID_OPERAND", "A regex SPLIT separator requires a default");
+      fail(invalidOperand, "A regex SPLIT separator requires a default");
    result.separator= result.keep? "" : result.variable
-      ? argument(state, source, "default", scope, depth, borrow) : result.pattern.expression;
-   if (typeof result.separator !== "string")
-      fail(state, "INVALID_OPERAND", "A regex SPLIT separator requires a string default");
+      ? argument(source, "default", scope, depth, borrow) : result.pattern.expression;
+   if (!isString(result.separator))
+      fail(invalidOperand, "A regex SPLIT separator requires a string default");
    if (owns(source, "trim"))
-      result.left= result.right= argument(state, source, "trim", scope, depth, splitPattern);
+      result.left= result.right= argument(source, "trim", scope, depth, splitPattern);
    else {
-      result.left= owns(source, "ltrim")? argument(state, source, "ltrim", scope, depth, splitPattern) : null;
-      result.right= owns(source, "rtrim")? argument(state, source, "rtrim", scope, depth, splitPattern) : null;
+      result.left= owns(source, "ltrim")? argument(source, "ltrim", scope, depth, splitPattern) : null;
+      result.right= owns(source, "rtrim")? argument(source, "rtrim", scope, depth, splitPattern) : null;
    }
-   result.element= owns(source, "element")? argument(state, source, "element", scope, depth, splitPattern) : null;
+   result.element= owns(source, "element")? argument(source, "element", scope, depth, splitPattern) : null;
    result.discard= get(source, "discard") === true;
-   if (owns(source, "discard") && typeof get(source, "discard") !== "boolean")
-      fail(state, "INVALID_OPERAND", "SPLIT discard must be boolean");
+   if (owns(source, "discard") && !isBoolean(get(source, "discard")))
+      fail(invalidOperand, "SPLIT discard must be boolean");
    return result;
 }
 
 // Return the longest consumed length, or -1. Suffix matching scans starts in
 // ascending order and requires an endpoint at the view end. Literal patterns
 // avoid successor allocation and still enforce both Unicode/view boundaries.
-function matchPattern(state, pattern, cursor, position, ending) {
+function matchPattern(pattern, cursor, position, ending) {
    var length, start, offset, end, positions, i, count, best= -1;
-   var path= state.graftPath, captures= state.captures;
+   var path= activeState.graftPath, captures= activeState.captures;
    if (!pattern) return 0;
-   state.graftPath= pattern.path;
-   state.captures= null;
+   activeState.graftPath= pattern.path;
+   activeState.captures= null;
    try {
-      length= sequenceLength(state, cursor, true);
+      length= sequenceLength(cursor, true);
       if (!pattern.regex) {
          start= ending? length - pattern.length : position;
          if (start < position || start + pattern.length > length) return -1;
-         offset= stringOffset(state, cursor.info, cursor.start + start);
+         offset= stringOffset(cursor.info, cursor.start + start);
          end= offset + pattern.expression.length;
-         charge(state, pattern.expression.length + 4, pattern.expression.length * 2);
+         charge(pattern.expression.length + 4, pattern.expression.length * 2);
          return stringSlice.call(cursor.info.text, offset, end) === pattern.expression
             && stringBoundary(cursor.info.text, end, !!cursor.info.checkpoints)? pattern.length : -1;
       }
       start= position;
       do {
-         charge(state, 1);
-         positions= sequenceTerm(state, pattern.expression, cursor.scope, pattern.depth,
+         charge(1);
+         positions= sequenceTerm(pattern.expression, cursor.scope, pattern.depth,
             start * 32 + 16, cursor);
-         count= typeof positions === "number"? 1 : positions.length;
-         charge(state, count);
+         count= isNumber(positions)? 1 : positions.length;
+         charge(count);
          for (i= 0; i < count; i++) {
-            end= typeof positions === "number"? positions : positions[i];
+            end= isNumber(positions)? positions : positions[i];
             if (end >= start && end <= length && (!ending || end === length))
                best= Math.max(best, end - start);
          }
@@ -2640,62 +2751,62 @@ function matchPattern(state, pattern, cursor, position, ending) {
       } while (start++ < length);
       return -1;
    } finally {
-      state.graftPath= path;
-      state.captures= captures;
+      activeState.graftPath= path;
+      activeState.captures= captures;
    }
 }
 
 // A reusable view supplies anchored element/trim matching without creating an
 // index or scope for each substring. Metadata distinguishes a real empty
 // separator from the final remainder, which inherits its predecessor's separator.
-function splitAppend(state, result, split, view, start, end, separator, config) {
+function splitAppend(result, split, view, start, end, separator, config) {
    var left, right, offset, limit, item, text= view.info.text;
    view.start= start;
    view.length= end - start;
-   left= Math.max(0, matchPattern(state, config.left, view, 0, false));
+   left= Math.max(0, matchPattern(config.left, view, 0, false));
    view.start+= left;
    view.length-= left;
-   right= Math.max(0, matchPattern(state, config.right, view, 0, true));
-   offset= stringOffset(state, view.info, start + left);
-   limit= stringOffset(state, view.info, end - right);
-   charge(state, end - start + 1, (limit - offset) * 2 + 8);
+   right= Math.max(0, matchPattern(config.right, view, 0, true));
+   offset= stringOffset(view.info, start + left);
+   limit= stringOffset(view.info, end - right);
+   charge(end - start + 1, (limit - offset) * 2 + 8);
    result.push(stringSlice.call(text, offset, limit));
    if (split) {
-      item= make(state);
-      offset= stringOffset(state, view.info, start);
-      limit= stringOffset(state, view.info, end);
-      charge(state, 1, config.discard? 0 : (limit - offset) * 2);
-      item.left= config.discard? "" : stringSlice.call(text, offset, stringOffset(state, view.info, start + left));
-      item.right= config.discard? "" : stringSlice.call(text, stringOffset(state, view.info, end - right), limit);
-      item.sep= separator !== null? separator : split.items.length
+      item= make();
+      offset= stringOffset(view.info, start);
+      limit= stringOffset(view.info, end);
+      charge(1, config.discard? 0 : (limit - offset) * 2);
+      item.left= config.discard? "" : stringSlice.call(text, offset, stringOffset(view.info, start + left));
+      item.right= config.discard? "" : stringSlice.call(text, stringOffset(view.info, end - right), limit);
+      item.sep= !isNull(separator)? separator : split.items.length
          ? split.items[split.items.length - 1].sep : config.separator;
-      charge(state, 1, 8);
+      charge(1, 8);
       split.items.push(item);
    }
 }
 
-function splitString(state, text, config, depth) {
-   var result= make(state, true), info, split, cursor, view, length, matched, sep, offset;
+function splitString(text, config, depth) {
+   var result= make(true), info, split, cursor, view, length, matched, sep, offset;
    var start= 0, field= 0, position= 0;
-   if (typeof text !== "string")
-      fail(state, "INVALID_TARGET", "SPLIT requires a string");
-   cursor= sequenceCursor(state, config.scope, text);
-   view= sequenceCursor(state, config.scope, text);
-   length= sequenceLength(state, cursor, true);
+   if (!isString(text))
+      fail(invalidTarget, "SPLIT requires a string");
+   cursor= sequenceCursor(config.scope, text);
+   view= sequenceCursor(config.scope, text);
+   length= sequenceLength(cursor, true);
    if (config.variable || !config.discard && (config.left || config.right)) {
-      info= arrayInfo(state, result, true);
-      split= info.split= make(state);
-      split.origin= make(state);
+      info= arrayInfo(result, true);
+      split= info.split= make();
+      split.origin= make();
       split.origin.separator= config.separator;
-      split.items= make(state, true);
+      split.items= make(true);
    }
    while (position <= length) {
-      charge(state, 3, 0, 0, depth);
-      matched= matchPattern(state, config.pattern, cursor, position, false);
+      charge(3, 0, 0, depth);
+      matched= matchPattern(config.pattern, cursor, position, false);
       if (matched >= 0 && !(matched === 0 && position === start) && config.element) {
          view.start= start;
          view.length= position - start;
-         if (matchPattern(state, config.element, view, 0, false) !== view.length) matched= -1;
+         if (matchPattern(config.element, view, 0, false) !== view.length) matched= -1;
       }
       if (matched < 0 || matched === 0 && position === start) {
          if (position !== length) {
@@ -2704,23 +2815,23 @@ function splitString(state, text, config, depth) {
          }
          // Empty input has one empty field unless its separator matches empty.
          if (start < length || !length && matched < 0)
-            splitAppend(state, result, split, view, field, length, null, config);
+            splitAppend(result, split, view, field, length, null, config);
          break;
       }
-      offset= stringOffset(state, cursor.info, position);
-      charge(state, matched + 1, matched * 4);
-      sep= stringSlice.call(text, offset, stringOffset(state, cursor.info, position + matched));
+      offset= stringOffset(cursor.info, position);
+      charge(matched + 1, matched * 4);
+      sep= stringSlice.call(text, offset, stringOffset(cursor.info, position + matched));
       // A zero-width end match only flushes the final field. Its metadata
       // inherits the preceding separator, and keep must not add a new element.
-      splitAppend(state, result, split, view, field,
+      splitAppend(result, split, view, field,
          position + (config.keep === "<"? matched : 0), position === length? null : config.keep? "" : sep, config);
       if (config.keep === "@" && position !== length)
-         splitAppend(state, result, split, view, position, position + matched, "", config);
+         splitAppend(result, split, view, position, position + matched, "", config);
       field= config.keep === ">"? position : position + matched;
       start= position + matched;
       if (position === length) break;
       if (matched && start === length) {
-         splitAppend(state, result, split, view, field, length, null, config);
+         splitAppend(result, split, view, field, length, null, config);
          break;
       }
       position= matched? start : position + 1;
@@ -2729,46 +2840,46 @@ function splitString(state, text, config, depth) {
    return result;
 }
 
-function joinArray(state, array, config) {
-   var info, item, pieces= make(state, true), value, length= 0, i;
-   if (type(array) !== "array")
-      fail(state, "INVALID_TARGET", "JOIN requires an array");
-   info= arrayInfo(state, array);
-   charge(state, array.length, array.length * 32);
+function joinArray(array, config) {
+   var info, item, pieces= make(true), value, length= 0, i;
+   if (!isArray(array))
+      fail(invalidTarget, "JOIN requires an array");
+   info= arrayInfo(array);
+   charge(array.length, array.length * 32);
    for (i= 0; i < array.length; i++) {
       value= get(array, i);
-      if (!present(state, array, i) || typeof value !== "string")
-         fail(state, "INVALID_TARGET", "A split array must contain strings");
+      if (!present(array, i) || !isString(value))
+         fail(invalidTarget, "A split array must contain strings");
       item= info && info.split? info.split.items[i] : null;
       pieces.push(item && !config.discard? item.left : "", value,
          item && !config.discard? item.right : "",
          i + 1 === array.length? "" : config.variable && item? item.sep : config.separator);
    }
-   charge(state, pieces.length);
+   charge(pieces.length);
    for (i= 0; i < pieces.length; i++)
       length+= pieces[i].length;
-   charge(state, length, length * 2);
+   charge(length, length * 2);
    return pieces.join("");
 }
 
-function splitAction(state, expression, scope, depth) {
+function splitAction(expression, scope, depth) {
    var config, value, i;
-   arity(state, expression, 2, Infinity);
-   config= argument(state, expression, 1, scope, depth, splitConfig);
-   value= splitString(state, read(state, scope.node, depth), config, depth);
-   write(state, scope.node, value, depth, true);
-   charge(state, expression.length - 2);
+   arity(expression, 2, Infinity);
+   config= argument(expression, 1, scope, depth, splitConfig);
+   value= splitString(read(scope.node, depth), config, depth);
+   write(scope.node, value, depth, true);
+   charge(expression.length - 2);
    for (i= 2; i < expression.length; i++)
-      argument(state, expression, i, scope, depth, action);
-   value= joinArray(state, read(state, scope.node, depth), config);
-   write(state, scope.node, value, depth, true);
+      argument(expression, i, scope, depth, action);
+   value= joinArray(read(scope.node, depth), config);
+   write(scope.node, value, depth, true);
 }
 
 // Copy lexical bindings while sharing holders whose data must remain visible.
-function scopeCopy(state, scope) {
-   var result= make(state), key;
+function scopeCopy(scope) {
+   var result= make(), key;
    for (key in scope) {
-      charge(state, 1);
+      charge(1);
       if (owns(scope, key))
          result[key]= scope[key];
    }
@@ -2777,145 +2888,152 @@ function scopeCopy(state, scope) {
 
 // Metadata constants are evaluated sequentially; macros retain their encoded
 // expression form and are expanded lazily when referenced.
-function declarations(state, metadata, key, scope, depth) {
+function declarations(metadata, key, scope, depth) {
    var source= get(metadata, key), name, value, i;
    if (!owns(metadata, key))
       return;
-   if (type(source) !== "array" || source.length % 2)
-      fail(state, "INVALID_GRAFT", "Metadata declarations require name/value pairs");
-   state.graftPath.push(1, key);
-   charge(state, source.length);
+   if (!isArray(source) || source.length % 2)
+      fail(invalidGraft, "Metadata declarations require name/value pairs");
+   activeState.graftPath.push(1, key);
+   charge(source.length);
    for (i= 0; i < source.length; i+= 2) {
       name= get(source, i);
-      if (typeof name !== "string" && !integer(name))
-         fail(state, "INVALID_GRAFT", "Invalid metadata declaration name");
-      value= key === "const"? argument(state, source, i + 1, scope, depth) : get(source, i + 1);
-      put(state, key === "const"? scope.constants.value : scope.expr, String(name), value);
+      if (!isString(name) && !integer(name))
+         fail(invalidGraft, "Invalid metadata declaration name");
+      value= key === "const"? argument(source, i + 1, scope, depth) : get(source, i + 1);
+      put(key === "const"? scope.constants.value : scope.expr, String(name), value);
    }
-   state.graftPath.pop();
-   state.graftPath.pop();
+   activeState.graftPath.pop();
+   activeState.graftPath.pop();
 }
 
 // Retain one complete diagnostic only after all operands succeed. Value
 // evaluation owns its data; export private dates before exposing the snapshot.
 // Unicode scalar decoding permits paired surrogates but rejects lone ones.
-function logAction(state, expression, scope, depth) {
+function logAction(expression, scope, depth) {
    var level= get(expression, 1), message, info, point, entry, code, i;
-   arity(state, expression, 3, 4);
-   if (typeof level === "string")
+   arity(expression, 3, 4);
+   if (isString(level))
       level= level === "info"? 0 : level === "warn"? 1 : level === "fail"? 2 : -1;
    if (level !== 0 && level !== 1 && level !== 2)
-      fail(state, "INVALID_GRAFT", "Invalid LOG level");
-   code= type(get(expression, 2)) === "array"? "INVALID_TARGET" : "INVALID_GRAFT";
-   message= argument(state, expression, 2, scope, depth);
-   if (typeof message !== "string")
-      fail(state, code, "LOG requires a string message");
-   info= stringInfo(state, message);
-   charge(state, message.length);
+      fail(invalidGraft, "Invalid LOG level");
+   code= isArray(get(expression, 2))? invalidTarget : invalidGraft;
+   message= argument(expression, 2, scope, depth);
+   if (!isString(message))
+      fail(code, "LOG requires a string message");
+   info= stringInfo(message);
+   charge(message.length);
    for (i= 0; i < message.length; i+= character(info, i, true)) {
       point= character(info, i);
       if (point < 32 || point >= 127 && point < 160
             || point >= 0xD800 && point <= 0xDFFF
             || point >= 0xFDD0 && point <= 0xFDEF || (point & 65535) >= 65534)
-         fail(state, code, "Forbidden LOG message codepoint");
+         fail(code, "Forbidden LOG message codepoint");
    }
-   entry= make(state);
+   entry= make();
    entry.level= level;
    entry.message= message;
    if (expression.length === 4)
-      entry.data= exportDates(state, argument(state, expression, 3, scope, depth), depth);
-   location(state, scope);
-   entry.graftPath= copy(state, state.graftPath, depth);
-   entry.inputPath= copy(state, state.inputPath, depth);
-   charge(state, 1, 72);
-   state.logs.push(entry);
+      entry.data= exportDates(argument(expression, 3, scope, depth), depth);
+   location(scope);
+   entry.graftPath= copy(activeState.graftPath, depth);
+   entry.inputPath= copy(activeState.inputPath, depth);
+   charge(1, 72);
+   activeState.logs.push(entry);
    if (level === 2)
-      fail(state, "NO_MATCH", message);
+      fail("NO_MATCH", message);
 }
 
-function action(state, expression, inherited, depth) {
+function action(expression, inherited, depth) {
    var id, scope, metadata, reference, value, element, i;
-   location(state, inherited);
-   charge(state, 1, 0, 0, depth);
-   if (type(expression) !== "array")
-      fail(state, "INVALID_GRAFT", "Expected an action array");
-   id= operation(state, expression, actions);
-   scope= scopeCopy(state, inherited);
+   location(inherited);
+   charge(1, 0, 0, depth);
+   if (!isArray(expression))
+      fail(invalidGraft, "Expected an action array");
+   id= operation(expression, actions);
+   scope= scopeCopy(inherited);
    // TEMP lasts for exactly this action, including all pairs of one COPY.
-   scope.temp= holder(state, make(state), true);
-   if (id === -1) {
-      arity(state, expression, 2, Infinity);
-      metadata= get(expression, 1);
-      if (type(metadata) !== "object" || owns(metadata, "v")
-            && (!integer(get(metadata, "v")) || get(metadata, "v") < 1))
-         fail(state, "INVALID_GRAFT", "Invalid JGraft metadata or version");
-      if (get(metadata, "v") > 1)
-         fail(state, "UNSUPPORTED_GRAFT", "Unsupported JGraft version");
-      scope.constants= holder(state, copy(state, scope.constants.value, depth, true), true);
-      scope.expr= copy(state, scope.expr, depth, true);
-      declarations(state, metadata, "const", scope, depth);
-      declarations(state, metadata, "expr", scope, depth);
-      // Constant declarations can see the parent's stash before this reset.
-      scope.stash= holder(state, make(state), true);
-      i= 2;
-   } else if (id === 0) {
-      arity(state, expression, 2, Infinity);
-      reference= argument(state, expression, 1, scope, depth, path);
-      if (reference.namespace !== 0)
-         fail(state, "INVALID_GRAFT", "AT requires a NODE reference");
-      read(state, reference, depth);
-      scope.node= reference;
-      i= 2;
-   } else if (id === 1) {
-      arity(state, expression, 2, Infinity);
-      value= argument(state, expression, 1, scope, depth, captureMatch);
-      if (value === false) {
-         state.graftPath.push(1);
-         location(state, scope);
-         fail(state, "NO_MATCH", "Current node does not match");
-      }
-      scope.cap= holder(state, value, true);
-      i= 2;
-   } else if (id === 2) {
-      charge(state, expression.length);
-      for (i= 1; i + 1 < expression.length; i+= 2)
-         if ((value= argument(state, expression, i, scope, depth, captureMatch)) !== false) {
-            scope.cap= holder(state, value, true);
-            i++;
-            break;
+   scope.temp= holder(make(), true);
+   // Integer IDs are -1..6 or LOG=10. Validate the gaps once so every
+   // decision below needs only its partition's upper bound.
+   if (id < ACT_JGRAFT || id > ACT_SPLIT && id !== ACT_LOG)
+      fail(invalidGraft, "Unsupported action");
+   if (id < ACT_COPY + 1) {
+      if (id < ACT_AT + 1) {
+         if (id < ACT_JGRAFT + 1) { // JGRAFT=-1
+            arity(expression, 2, Infinity);
+            metadata= get(expression, 1);
+            if (type(metadata) !== TYPE_OBJECT || owns(metadata, "v")
+                  && (!integer(get(metadata, "v")) || get(metadata, "v") < 1))
+               fail(invalidGraft, "Invalid JGraft metadata or version");
+            if (get(metadata, "v") > 1)
+               fail(unsupportedGraft, "Unsupported JGraft version");
+            scope.constants= holder(copy(scope.constants.value, depth, true), true);
+            scope.expr= copy(scope.expr, depth, true);
+            declarations(metadata, "const", scope, depth);
+            declarations(metadata, "expr", scope, depth);
+            // Constant declarations can see the parent's stash before this reset.
+            scope.stash= holder(make(), true);
+            i= 2;
+         } else { // AT=0
+            arity(expression, 2, Infinity);
+            reference= argument(expression, 1, scope, depth, path);
+            if (reference.namespace !== 0)
+               fail(invalidGraft, "AT requires a NODE reference");
+            read(reference, depth);
+            scope.node= reference;
+            i= 2;
          }
-      // A final singleton is the else action and retains inherited captures.
-      if (i < expression.length)
-         argument(state, expression, i, scope, depth, action);
-      return;
-   } else if (id === 3) {
-      if (expression.length % 2 !== 1)
-         fail(state, "INVALID_GRAFT", "COPY requires value/path pairs");
-      charge(state, expression.length);
-      for (i= 1; i < expression.length; i+= 2) {
-         // Finish the source before resolving a destination that may overlap it.
-         value= argument(state, expression, i, scope, depth);
-         element= state.element;
-         state.graftPath.push(i + 1);
-         reference= path(state, get(expression, i + 1), scope, depth + 1, true);
-         write(state, reference, value, depth + 1, true, element);
-         state.graftPath.pop();
+      } else if (id < ACT_MATCH + 1) { // MATCH=1
+         arity(expression, 2, Infinity);
+         value= argument(expression, 1, scope, depth, captureMatch);
+         if (value === false) {
+            activeState.graftPath.push(1);
+            location(scope);
+            fail("NO_MATCH", "Current node does not match");
+         }
+         scope.cap= holder(value, true);
+         i= 2;
+      } else if (id < ACT_IF + 1) { // IF=2
+         charge(expression.length);
+         for (i= 1; i + 1 < expression.length; i+= 2)
+            if ((value= argument(expression, i, scope, depth, captureMatch)) !== false) {
+               scope.cap= holder(value, true);
+               i++;
+               break;
+            }
+         // A final singleton is the else action and retains inherited captures.
+         if (i < expression.length)
+            argument(expression, i, scope, depth, action);
+         return;
+      } else { // COPY=3
+         if (expression.length % 2 !== 1)
+            fail(invalidGraft, "COPY requires value/path pairs");
+         charge(expression.length);
+         for (i= 1; i < expression.length; i+= 2) {
+            // Finish the source before resolving a destination that may overlap it.
+            value= argument(expression, i, scope, depth);
+            element= activeState.element;
+            activeState.graftPath.push(i + 1);
+            reference= path(get(expression, i + 1), scope, depth + 1, true);
+            write(reference, value, depth + 1, true, element);
+            activeState.graftPath.pop();
+         }
+         return;
       }
+   } else if (id < ACT_SPLICE + 1) { // MOVE=4, SPLICE=5
+      (id < ACT_MOVE + 1? move : splice)(expression, scope, depth);
       return;
-   } else if (id === 4 || id === 5) {
-      (id === 4? move : splice)(state, expression, scope, depth);
+   } else if (id < ACT_SPLIT + 1) { // SPLIT=6
+      splitAction(expression, scope, depth);
       return;
-   } else if (id === 6) {
-      splitAction(state, expression, scope, depth);
+   } else { // LOG=10; 7..9 and >10 were rejected above.
+      logAction(expression, scope, depth);
       return;
-   } else if (id === 10) {
-      logAction(state, expression, scope, depth);
-      return;
-   } else
-      fail(state, "INVALID_GRAFT", "Unsupported action");
-   charge(state, expression.length - i);
+   }
+   charge(expression.length - i);
    for (; i < expression.length; i++)
-      argument(state, expression, i, scope, depth, action);
+      argument(expression, i, scope, depth, action);
 }
 
 // apply(input[, {clone:true}]) leaves input unchanged and returns the new tree.
@@ -2923,22 +3041,28 @@ function action(state, expression, inherited, depth) {
 // Counts/logs are replaced for each attempt, including failures. Config limits are
 // copied at construction; apply options are borrowed for this synchronous call.
 JGraft.prototype.apply= function(input, options) {
-   var state= createState(this, input), scope= make(state);
-   scope.node= make(state);
-   scope.node.tree= state.tree;
-   scope.node.keys= make(state, true);
-   scope.constants= holder(state, make(state), true);
-   scope.stash= holder(state, make(state), true);
-   scope.temp= holder(state, make(state), true);
-   scope.cap= holder(state, make(state), true);
-   scope.expr= make(state);
-   if (type(this._graft) !== "array" || get(this._graft, 0) !== "JGRAFT")
-      fail(state, "INVALID_GRAFT", "The root action must be JGRAFT");
-   action(state, this._graft, scope, 1);
-   // Detach untouched branches only after execution, using the same counters.
-   if (get(options, "clone") === true)
-      state.tree.value= copy(state, state.tree.value, 1);
-   return state.tree.value;
+   var previousState= activeState, state, scope;
+   try {
+      state= createState(this, input);
+      scope= make();
+      scope.node= make();
+      scope.node.tree= state.tree;
+      scope.node.keys= make(true);
+      scope.constants= holder(make(), true);
+      scope.stash= holder(make(), true);
+      scope.temp= holder(make(), true);
+      scope.cap= holder(make(), true);
+      scope.expr= make();
+      if (!isArray(this._graft) || get(this._graft, 0) !== "JGRAFT")
+         fail(invalidGraft, "The root action must be JGRAFT");
+      action(this._graft, scope, 1);
+      // Detach untouched branches only after execution, using the same counters.
+      if (get(options, "clone") === true)
+         state.tree.value= copy(state.tree.value, 1);
+      return state.tree.value;
+   } finally {
+      activeState= previousState;
+   }
 };
 
 global.JGraft= JGraft;
