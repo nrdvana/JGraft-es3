@@ -53,6 +53,20 @@ diagnostic trees are not defensively cloned. Paths inside temporary or constant
 namespaces describe the location in that namespace. Invalid resource
 configuration throws a `TypeError` during construction.
 
+LOG collects diagnostics in `graft.logs`, initially null and replaced with a
+fresh array for each application, including failures. Entries contain numeric
+`level` (0 info, 1 warn, 2 fail), `message`, `graftPath`, and `inputPath`;
+`data` is included only when supplied. Data snapshots are independent of
+later input/output edits, including mutable native Dates. Logical dates are
+exported as strings. Errors expose the same attempt array as `error.logs`,
+and retained arrays survive subsequent applications. Reading entries does not
+clone them. No callback or console output is used.
+
+A fail-level entry is collected before throwing `NO_MATCH`, with its message
+as the error message. Invalid message expression results raise `INVALID_TARGET`; invalid literal
+messages, levels, or arity raise `INVALID_GRAFT`. Failed argument evaluation does not append
+an entry. Validation, copying, and retention use the ordinary resource budgets.
+
 `UNSUPPORTED_GRAFT` reports a valid positive integer version newer than this
 implementation supports, numeric range or configured date-resolution loss,
 or a property operation forbidden by the host configuration.
@@ -67,11 +81,11 @@ insertions are omitted.
 SPLICE evaluates every replacement before changing its target. A resource
 failure while committing an edit can still leave a partially edited result.
 
-Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF,
+Currently implemented: COPY, MOVE, SPLICE, JGRAFT scopes, AT, MATCH, IF, LOG,
 HAS, IS, NONE, ANY, ALL, EXISTS, ARRAY, BOOL, NUM, NODE/TEMP/STASH/CONST/CAP references,
 EXPR expansion, STR, SEQ, SEQMIN, SEQMAX, REP, START, END, CHARS, CAPTURE,
-LOCAL, WITH, NOT, LENGTH, CURPROP, SLICE, CONCAT, REDUCE, FILTER, MAP,
-MKOBJ, CASE, FAIL, CASTBOOL, CASTNUM,
+LOCAL, WITH, NOT, AND, OR, LENGTH, CURPROP, SLICE, CONCAT, REDUCE, FILTER, MAP,
+PROPS, MKOBJ, CASE, FAIL, CASTBOOL, CASTNUM,
 CASTSTR, DATE, CASTDATE, LESS, LESSEQ, ADD, SUB, MUL, DIV, and MOD.
 SPLIT actions/expressions and JOIN support literal and
 regex separators, longest matches, keep modes, element constraints, trimming,
@@ -80,7 +94,7 @@ Array and string sequences share the matcher, including ALL successor coverage,
 repetition, capture preferences, and MATCH/IF capture namespaces. CHARS supports
 Unicode character lists, inclusive ranges, inclusion/exclusion, and common
 CHARS expressions. Outside regex context it accepts integer codepoints and
-one-codepoint strings. Remaining expressions are pending.
+one-codepoint strings. All nine actions and 54 expressions are implemented.
 
 LOCAL supports sequential TEMP bindings and temporary NODE overrides, returning
 its final expression as a value. WITH accepts literal string/integer TEMP names
@@ -92,6 +106,11 @@ result, or its else value. Without a matching condition or an explicit else,
 it raises `INVALID_TARGET`, like FAIL. FAIL in a condition becomes a non-match;
 FAIL in a selected result propagates. LOCAL can rebind NODE to a discriminator
 so CASE conditions use direct patterns.
+
+AND, OR, and NOT accept only primitive booleans and short-circuit in operand
+order. NOT with multiple arguments means NOR. PROPS enumerates own object
+properties in Unicode codepoint order, returning names, pairs, or parallel
+name/value arrays. Value-bearing forms copy their values independently.
 
 LESS and LESSEQ compare booleans, numbers, Unicode codepoint strings,
 lexicographic arrays, and dates of the same precision. Mismatched types and
@@ -171,9 +190,11 @@ supported input model.
 Run `prove` from the repository or pass its test directory from another working
 directory. The default engine is PhantomJS when available, otherwise Node.
 `TESTJS=node`, `TESTJS=phantomjs`, and `TESTJS=all` select engines explicitly;
-`all` runs both in parallel. All 6,521 conformance cases across thirty-two
-collections and local implementation tests are active without TODO markers.
-The default adapter explicitly skips the thirty-eight cases with `needProto: true`
+`all` runs both in parallel. The conformance files contain 7,591 cases across
+thirty-seven collections, all running without conformance TODOs.
+`t/05-conformance-inventory.t` checks that every fixture file has a registered
+test runner. The default adapter explicitly skips the forty-seven cases with
+`needProto: true`
 when `forbidProto` is enabled. Names and descriptions do not affect skipping.
 Unrestricted runs execute all cases. Descriptor-built support tests explicitly disable the
 restriction; host-restriction tests separately verify rejection on every engine.

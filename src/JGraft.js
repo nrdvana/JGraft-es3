@@ -22,13 +22,13 @@ var surrogatePair= /[\uD800-\uDBFF][\uDC00-\uDFFF]/;
 var jsonNumber= /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?(?![\s\S])/;
 var nonzeroMantissa= /^[^eE]*[1-9]/;
 var defaults= {mem: 67108864, ops: 1000000, new_obj: 100000, depth: 128};
-var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6};
+var actions= {JGRAFT: -1, AT: 0, MATCH: 1, IF: 2, COPY: 3, MOVE: 4, SPLICE: 5, SPLIT: 6, LOG: 10};
 var expressions= {EXPR: -5, CAP: -4, TEMP: -3, STASH: -2, CONST: -1, NODE: 0,
    HAS: 1, IS: 2, NONE: 3, ANY: 4, ALL: 5, EXISTS: 6, ARRAY: 7, STR: 8, NUM: 9, BOOL: 10, DATE: 11, WITH: 12,
    SEQ: 13, SEQMAX: 14, SEQMIN: 15,
    REP: 16, START: 17, END: 18, CHARS: 19, CAPTURE: 50,
-   LOCAL: 51, NOT: 52, LENGTH: 55, CURPROP: 56, SLICE: 57, CONCAT: 58,
-   REDUCE: 59, FILTER: 60, MAP: 61, SPLIT: 62, JOIN: 63, MKOBJ: 65, CASE: 66, FAIL: 67,
+   LOCAL: 51, NOT: 52, AND: 53, OR: 54, LENGTH: 55, CURPROP: 56, SLICE: 57, CONCAT: 58,
+   REDUCE: 59, FILTER: 60, MAP: 61, SPLIT: 62, JOIN: 63, PROPS: 64, MKOBJ: 65, CASE: 66, FAIL: 67,
    CASTBOOL: 68, CASTNUM: 69, CASTSTR: 70, CASTDATE: 71, LESS: 72, LESSEQ: 73,
    ADD: 74, SUB: 75, MUL: 76, DIV: 77, MOD: 78};
 // Probe an isolated object, since engines disagree on __proto__ assignment.
@@ -308,6 +308,7 @@ function JGraft(graft, config) {
       this._limits[key]= value;
    }
    this.counts= null;
+   this.logs= null;
 }
 
 // Each attempt owns its counters. mem is a conservative allocation estimate,
@@ -338,6 +339,7 @@ function fail(state, code, message) {
    error.partial= state.tree? state.tree.value : state.input;
    // Keep this attempt's counters even after the instance is applied again.
    error.counts= state.counts;
+   error.logs= state.logs;
    error.limits= {mem: state.limits.mem, ops: state.limits.ops,
       new_obj: state.limits.new_obj, depth: state.limits.depth};
    if (state.resource)
@@ -404,10 +406,11 @@ function createState(instance, input) {
    var state= {input: input, limits: instance._limits, forbidProto: instance.forbidProto,
       dateDigits: instance._dateDigits, truncateDateResolution: instance.truncateDateResolution,
       counts: {mem: 0, ops: 0, new_obj: 0, depth: 0},
-      graftPath: [], inputPath: []};
-   // Publish before any limit check so failed attempts also expose counts.
+      graftPath: [], inputPath: [], logs: []};
+   // Publish before any limit check so failed attempts expose counts and logs.
    instance.counts= state.counts;
-   charge(state, 1, 256, 4);
+   instance.logs= state.logs;
+   charge(state, 1, 288, 5);
    state.tree= holder(state, input, false);
    state.arrays= make(state, true);
    return state;
@@ -1956,17 +1959,18 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       arity(state, expression, 2, 2);
       return argument(state, expression, 1, scope, depth, captureMatch);
    }
-   if (id === 52) {
+   if (id >= 52 && id <= 54) {
       arity(state, expression, 2, Infinity);
       charge(state, expression.length);
       for (i= 1; i < expression.length; i++) {
          value= argument(state, expression, i, scope, depth, borrow);
          if (typeof value !== "boolean")
-            fail(state, "INVALID_TARGET", "NOT requires boolean arguments");
-         if (value)
-            return false;
+            fail(state, "INVALID_TARGET", "Boolean functions require boolean arguments");
+         // AND stops at false; OR and NOT/NOR stop at true.
+         if (value === (id !== 53))
+            return id === 54;
       }
-      return true;
+      return id !== 54;
    }
    if (id === 55 || id >= 68 && id <= 71) {
       arity(state, expression, 1, 2);
@@ -1993,6 +1997,8 @@ function evaluateValue(state, expression, scope, depth, borrowed) {
       return slice(state, expression, scope, depth);
    if (id === 58)
       return concat(state, expression, scope, depth);
+   if (id === 64)
+      return objectProperties(state, expression, scope, depth);
    if (id === 65)
       return makeObject(state, expression, scope, depth);
    if (id === 62 || id === 63) {
@@ -2084,6 +2090,36 @@ function compare(state, left, right, depth) {
       fail(state, "INVALID_TARGET", "This type is not orderable");
    if (left !== left || right !== right) fail(state, "INVALID_TARGET", "NaN is not orderable");
    return left < right? -1 : left > right? 1 : 0;
+}
+
+// Enumerate only own keys, sorted by the same Unicode order as LESS/LESSEQ.
+// Names need no value traversal; value-bearing forms own independent copies.
+function objectProperties(state, expression, scope, depth) {
+   var option= get(expression, 2), source, names, values, value, i;
+   arity(state, expression, 1, 3);
+   if (expression.length === 3 && option !== 1 && option !== 2)
+      fail(state, "INVALID_GRAFT", "PROPS requires literal option 1 or 2");
+   source= expression.length === 1? read(state, scope.node, depth)
+      : argument(state, expression, 1, scope, depth, borrow);
+   if (type(source) !== "object")
+      fail(state, "INVALID_TARGET", "PROPS requires an object");
+   names= keys(state, source);
+   charge(state, names.length * (1 + Math.log(names.length || 1) / Math.LN2), names.length * 16);
+   names.sort(function(left, right) {return compare(state, left, right, depth);});
+   if (expression.length < 3) return names;
+   values= make(state, true);
+   charge(state, names.length, names.length * 8);
+   for (i= 0; i < names.length; i++) {
+      value= copy(state, get(source, names[i]), depth + 1);
+      values.push(option === 1? makePair(state, names[i], value) : value);
+   }
+   return option === 1? values : makePair(state, names, values);
+}
+
+// Allocate an owned two-element array with one combined resource charge.
+function makePair(state, left, right) {
+   charge(state, 2, 48, 1);
+   return [left, right];
 }
 
 // Fold explicit value operands, or ADD/MUL's sole array operand as numeric
@@ -2760,6 +2796,43 @@ function declarations(state, metadata, key, scope, depth) {
    state.graftPath.pop();
 }
 
+// Retain one complete diagnostic only after all operands succeed. Value
+// evaluation owns its data; export private dates before exposing the snapshot.
+// Unicode scalar decoding permits paired surrogates but rejects lone ones.
+function logAction(state, expression, scope, depth) {
+   var level= get(expression, 1), message, info, point, entry, code, i;
+   arity(state, expression, 3, 4);
+   if (typeof level === "string")
+      level= level === "info"? 0 : level === "warn"? 1 : level === "fail"? 2 : -1;
+   if (level !== 0 && level !== 1 && level !== 2)
+      fail(state, "INVALID_GRAFT", "Invalid LOG level");
+   code= type(get(expression, 2)) === "array"? "INVALID_TARGET" : "INVALID_GRAFT";
+   message= argument(state, expression, 2, scope, depth);
+   if (typeof message !== "string")
+      fail(state, code, "LOG requires a string message");
+   info= stringInfo(state, message);
+   charge(state, message.length);
+   for (i= 0; i < message.length; i+= character(info, i, true)) {
+      point= character(info, i);
+      if (point < 32 || point >= 127 && point < 160
+            || point >= 0xD800 && point <= 0xDFFF
+            || point >= 0xFDD0 && point <= 0xFDEF || (point & 65535) >= 65534)
+         fail(state, code, "Forbidden LOG message codepoint");
+   }
+   entry= make(state);
+   entry.level= level;
+   entry.message= message;
+   if (expression.length === 4)
+      entry.data= exportDates(state, argument(state, expression, 3, scope, depth), depth);
+   location(state, scope);
+   entry.graftPath= copy(state, state.graftPath, depth);
+   entry.inputPath= copy(state, state.inputPath, depth);
+   charge(state, 1, 72);
+   state.logs.push(entry);
+   if (level === 2)
+      fail(state, "NO_MATCH", message);
+}
+
 function action(state, expression, inherited, depth) {
    var id, scope, metadata, reference, value, element, i;
    location(state, inherited);
@@ -2835,6 +2908,9 @@ function action(state, expression, inherited, depth) {
    } else if (id === 6) {
       splitAction(state, expression, scope, depth);
       return;
+   } else if (id === 10) {
+      logAction(state, expression, scope, depth);
+      return;
    } else
       fail(state, "INVALID_GRAFT", "Unsupported action");
    charge(state, expression.length - i);
@@ -2844,7 +2920,7 @@ function action(state, expression, inherited, depth) {
 
 // apply(input[, {clone:true}]) leaves input unchanged and returns the new tree.
 // clone requests independence from all input/graft objects, including Dates.
-// Counts are replaced for each attempt, including failures. Config limits are
+// Counts/logs are replaced for each attempt, including failures. Config limits are
 // copied at construction; apply options are borrowed for this synchronous call.
 JGraft.prototype.apply= function(input, options) {
    var state= createState(this, input), scope= make(state);

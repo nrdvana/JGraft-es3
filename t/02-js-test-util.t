@@ -49,6 +49,54 @@ TAP(function(t) {
       t.ok(!result.results[0].results[0].success, 'input assertion detects the mutation');
    }
 
+   t.subtest('portable log expectations', function(t) {
+      var record={level:0,message:'message'}, test;
+      function logged(input,graft,limits,logs) {logs.push(record);return input;}
+      test=fixture(null,null);test.logs=[record];
+      t.ok(check(test,logged).success,'custom executors can append observed records');
+      t.ok(!check(test,function(input) {return input;}).success,'missing messages fail');
+      test.logs=[];
+      t.ok(!check(test,logged).success,'explicit empty logs reject extra messages');
+      t.ok(check(test,function(input) {return input;}).success,'empty matches empty');
+      delete test.logs;
+      t.ok(check(test,logged).success,'omitted logs leave messages unchecked');
+      test.logs=[{level:1,message:'message'}];
+      t.ok(!check(test,logged).success,'levels are compared');
+      test.logs=[{level:0,message:'different'}];
+      t.ok(!check(test,logged).success,'messages are compared');
+      test.logs=[{level:0,message:'message',data:null}];
+      t.ok(!check(test,logged).success,'absent data differs from null');
+      test.logs=[{level:0,message:'message',data:{x:[1]}}];
+      t.ok(!check(test,function(input,graft,limits,logs) {
+         logs.push({level:0,message:'message',data:{x:[2]}});return input;
+      }).success,'nested data is compared structurally');
+      test.logs=[record,{level:1,message:'second'}];
+      t.ok(!check(test,function(input,graft,limits,logs) {
+         logs.push({level:1,message:'second'},record);return input;
+      }).success,'record order is significant');
+      test=fixture(null);test.errors={NO_MATCH:true};test.logs=[record];
+      t.ok(check(test,function(input,graft,limits,logs) {
+         logs.push(record);throw {code:'NO_MATCH'};
+      }).success,'records are compared on runtime errors');
+      t.ok(!check(test,function() {throw {code:'NO_MATCH'};}).success,
+         'missing fatal records fail even when the error code matches');
+      test.errors={INVALID_GRAFT:true};
+      t.ok(check(test,function() {throw {code:'INVALID_GRAFT'};}).success,
+         'static graft rejection need not execute logging');
+      test=fixture(null,null);test.logs={};
+      t.ok(!check(test,logged).success,'non-array log expectations are rejected');
+      test=fixture(null,null);test.logs=[record];
+      test.jgraft=['JGRAFT',{v:1},['LOG','info','message']];
+      t.ok(check(test).success,'default adapter omits implementation-specific paths');
+      test=fixture(null);test.errors={NO_MATCH:true};
+      test.logs=[{level:2,message:'reason',data:null}];
+      test.jgraft=['JGRAFT',{v:1},['LOG','fail','reason',null]];
+      t.ok(check(test).success,'default adapter collects fatal records before propagating errors');
+      test=fixture(null,null);test.logs=[];
+      test.jgraft=['JGRAFT',{v:1},['LOG','info','unwanted']];
+      t.ok(!check(test).success,'default adapter checks empty expectations');
+   });
+
    t.subtest('result comparison', function(t) {
       t.ok(check(fixture(null, null), function() { return null; }).success, 'null output is present');
       t.ok(check(fixture({}, {a: [1, false, null]}), function() { return {a: [1, false, null]}; }).success, 'nested JSON matches');

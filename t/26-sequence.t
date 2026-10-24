@@ -115,60 +115,40 @@ TAP(function(t) {
    for (i= 0; i < pairs.length; i++)
          check('aaa', ['STR',['REP',pairs[i][0],pairs[i][1],'a']], 'NO_MATCH', 'invalid bounds ' + i);
 
-   function captureCheck(input, pattern, expected, name, metadata) {
-      t.subtest(name, function(t) {
-         var original= JSON.stringify(input);
-         t.is(new JGraft(['JGRAFT',metadata || {v:1},
-            ['COPY',['CAPTURE',pattern],['NODE']]]).apply(input),expected,'selected captures');
-         t.is(JSON.stringify(input),original,'input preserved');
-      });
-   }
+   // Portable capture boundaries, names, namespace results, and split matrices
+   // live in 36-capture.json. Keep native ownership/reuse and budgets here.
    function range(offset, length, path) {
       return {path:path || [],ofs:offset,len:length,lim:offset+length};
    }
    var many= ['REP',0,-1,['EXISTS']];
-   captureCheck([1,2,3],[[['SEQMIN','a',many],['SEQMIN','b',many]]],
-      {a:range(0,0),b:range(0,0)},'partial captures prefer shortest groups independently of total consumption');
-   captureCheck([1,2,3],['IS',[[['SEQMIN','a',many],['SEQMIN','b',many]]]],
-      {a:range(0,0),b:range(0,3)},'capture preferences resolve after the entire exact match');
-   captureCheck([1,2,3],['IS',[[['SEQMAX','a',many],['SEQMAX','b',many]]]],
-      {a:range(0,3),b:range(3,0)},'earlier group length preferences take priority');
-   captureCheck([1,2,3],['IS',[[['SEQMAX',null,many],['SEQMAX','b',many]]]],
-      {b:range(3,0)},'unnamed groups retain their length preference');
-   captureCheck([1,1,1],[[['SEQ',many],['SEQMIN','a',1]]],
-      {a:range(0,1)},'equal capture lengths prefer the earliest start');
-   captureCheck([1,2,3],[[['SEQMAX','a',many],['SEQMIN','b',many]]],
-      {a:range(0,3),b:range(3,0)},'partial captures can select a later endpoint');
-   captureCheck([1,2],[[['EXPR','group']]],{a:range(0,2)},
-      'common expressions expose root named sequences',{v:1,expr:['group',[14,'a',many]]});
-   captureCheck([{a:[1],b:[2]},{a:[3],b:[4]},{a:[5],b:[6]}],
-      [[['SEQ',many,{a:[[['SEQMAX','a',many]]]},many,{b:[[['SEQMAX','b',many]]]},many]]],
-      {a:range(0,1,[0,'a']),b:range(0,1,[1,'b'])},
-      'substructure captures select earliest placements in specification order');
-   captureCheck([1],[[['SEQMIN',null],['SEQMAX','a',many]]],
-      {a:range(0,1)},'empty unnamed groups do not create a capture');
-   captureCheck([1],['IS',[[['SEQMAX','a',2]]]],false,
-      'failed CAPTURE returns false');
-   captureCheck([{x:[1]},{x:[2]},{x:[3]}],['IS',[[
-      ['SEQ',['ANY',['REP',2,0,['EXISTS']],['SEQ'],['EXISTS']]],
-      {x:[[ ['SEQMAX','a',['EXISTS']] ]]},['SEQ',many]]]],
-      {a:range(0,1,[0,'x'])},'root substructure placement is independent of frontier order');
+   t.subtest('capture __proto__ is an own data property',function(t) {
+      var expected={}, output;
+      Object.defineProperty(expected,'__proto__',{value:range(0,1),enumerable:true});
+      output=new JGraft(['JGRAFT',{v:1},['COPY',['CAPTURE',
+         [[['SEQMAX','__proto__',1]]]],['NODE']]],{forbidProto:false}).apply([1]);
+      t.is(output,expected,'capture data preserves the arbitrary key');
+      t.ok(Object.prototype.hasOwnProperty.call(output,'__proto__'),'the key is owned');
+      t.is(Object.getOwnPropertyDescriptor(output,'__proto__').value,range(0,1),
+         'a native descriptor exposes the data value');
+   });
+   t.subtest('CAPTURE state resets between applications',function(t) {
+      var instance=new JGraft(['JGRAFT',{v:1},['COPY',['CAPTURE',
+         ['IS',[[['SEQMAX','prefix',1],['SEQMAX','x',['REP',1,-1,1]]]]]],['NODE']]]);
+      var first=instance.apply([1,1,1]);
+      t.is(first,{prefix:range(0,1),x:range(1,2)},'the first successful match records its ranges');
+      t.is(instance.apply([1,2]),false,'failure after a partial capture leaves no stale result');
+      first.x.ofs=9;
+      t.is(instance.apply([1,1]),{prefix:range(0,1),x:range(1,1)},'reuse after failure and output mutation starts fresh');
+   });
    t.subtest('capture namespaces and ownership',function(t) {
       var input= {nested:[1,2]}, pattern= {nested:[[ ['SEQMAX','a',many] ]]};
       var graft= new JGraft(['JGRAFT',{v:1},['MATCH',pattern,
          ['COPY',['SLICE',['CAP','a']],'saved',['CAP'],'bounds']]]);
       var output= graft.apply(input);
-      t.is(output.saved,[1,2],'captured paths can be sliced relative to the match node');
-      t.is(output.bounds,{a:range(0,2,['nested'])},'MATCH publishes its capture namespace');
+      t.ok(output.saved !== input.nested,'captured slices have independent array identity');
       output.saved[0]= 9;
       t.is(input,{nested:[1,2]},'captured slices retain input isolation');
       t.is(graft.apply(input).saved,[1,2],'reusing an instance starts a new match state');
-      output= new JGraft(['JGRAFT',{v:1},['IF',pattern,
-         ['COPY',['CAP'],['NODE']]]]).apply(input);
-      t.is(output,{a:range(0,2,['nested'])},'IF publishes the selected condition captures');
-      output= new JGraft(['JGRAFT',{v:1},['COPY',
-         ['HAS',[[['SEQMAX',['FAIL'],many]]]],['NODE']]]).apply([1]);
-      t.is(output,true,'boolean function matches do not evaluate capture names');
    });
    t.subtest('capture annotation resource budgets',function(t) {
       var input= new Array(33), i, error, graft, output;

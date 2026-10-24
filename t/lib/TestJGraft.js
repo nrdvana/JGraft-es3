@@ -1,6 +1,7 @@
 // TestJGraft.runConformanceTests(t, filenameOrSuite[, apply]) runs one suite as a TAP subtest.
 // Filenames are relative to the test file. Inline suites may contain Dates.
-// apply(input, graft, limits) returns the output or throws an error with .code.
+// apply(input, graft, limits, logs) returns output or throws an error with .code;
+// append portable {level,message,data?} records to logs, including before errors.
 // String error codes are also accepted. Supplying apply lets this helper be
 // tested independently and keeps the eventual library API in one adapter.
 (function(global) {
@@ -190,10 +191,14 @@ TestJGraft.noteError= function(t, error, context) {
 function runCase(t, test, apply, forbidProto) {
    t.subtest(test.name, function(t) {
       t._jgraftDescription= test.desc;
-      var before, output, error, caught= false, code, allowed= test.errors || {};
+      var before, output, error, logs= [], caught= false, code, allowed= test.errors || {};
       var mustLimit= owns(allowed, "RESOURCE_LIMIT") && allowed.RESOURCE_LIMIT === true;
       if (!owns(test, "input") || !owns(test, "jgraft") || (!owns(test, "output") && !owns(test, "errors"))) {
          t.fail("Case requires input, jgraft, and output or errors");
+         return;
+      }
+      if (owns(test, "logs") && tag(test.logs) !== "[object Array]") {
+         t.fail("Expected logs must be an array");
          return;
       }
       // The explicit requirement survives a parser which has lost the key.
@@ -204,7 +209,7 @@ function runCase(t, test, apply, forbidProto) {
       }
       before= snapshot(test.input);
       try {
-         output= apply(test.input, test.jgraft, test.limits);
+         output= apply(test.input, test.jgraft, test.limits, logs);
       } catch (exception) {
          caught= true;
          error= exception;
@@ -224,14 +229,29 @@ function runCase(t, test, apply, forbidProto) {
       } else if (!t.ok(equal(output, test.output), "output matches")) {
          t.noteDifferences(test.output, output);
       }
+      // Static validation may reject the entire graft before any action runs.
+      if (owns(test, "logs") && code !== "INVALID_GRAFT"
+            && !t.ok(equal(logs, test.logs), "logs match"))
+         t.noteDifferences(test.logs, logs);
    });
    // Filtered callbacks never execute, but their leaf still counts as a skip.
    t.results[t.results.length - 1]._jgraftCase= true;
 }
 
 // Provisional adapter: this is the only place tied to the implementation API.
-function applyGraft(input, graft, limits) {
-   return new global.JGraft(graft, {limits: limits}).apply(input);
+function applyGraft(input, graft, limits, logs) {
+   var instance= new global.JGraft(graft, {limits: limits}), entries, entry, i;
+   try {
+      return instance.apply(input);
+   } finally {
+      // Project observations onto the portable shape, omitting host metadata.
+      entries= instance.logs || [];
+      for (i= 0; i < entries.length; i++) {
+         entry= {level: entries[i].level, message: entries[i].message};
+         if (owns(entries[i], "data")) entry.data= entries[i].data;
+         logs.push(entry);
+      }
+   }
 }
 
 // Count fixtures, rather than their assertions or enclosing engine/suite groups.
